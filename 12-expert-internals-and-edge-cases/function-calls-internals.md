@@ -2,7 +2,7 @@
 
 ## Concept
 
-Every Python function call creates a **frame object** (`PyFrameObject`) — a Python-level object that represents one level of the call stack. Understanding frames is essential for comprehending debuggers, profilers, tracebacks, and performance characteristics.
+Every function call in CPython creates a `PyFrameObject` — a data structure holding the local variables, value stack, bytecode pointer, and enclosing scope information. Understanding frame objects explains the call stack, how introspection works, and why Python function calls are relatively expensive compared to C.
 
 ### Frame Objects
 
@@ -10,290 +10,336 @@ Every Python function call creates a **frame object** (`PyFrameObject`) — a Py
 import sys
 import inspect
 
-def inner():
-    frame = sys._getframe()          # current frame
-    caller = sys._getframe(1)        # caller's frame
-    
-    print(f"Current function: {frame.f_code.co_name}")
-    print(f"Caller function:  {caller.f_code.co_name}")
-    print(f"Current locals:   {frame.f_locals}")
-    print(f"Line number:      {frame.f_lineno}")
-    print(f"File:             {frame.f_code.co_filename}")
+def inner(x):
+    # Access the current frame:
+    frame = sys._getframe()                # current frame
+    caller_frame = sys._getframe(1)        # caller's frame
+
+    print(f"Current function: {frame.f_code.co_name}")   # 'inner'
+    print(f"Caller function: {caller_frame.f_code.co_name}")
+
+    print(f"Local variables: {frame.f_locals}")    # {'x': 42}
+    print(f"File: {frame.f_code.co_filename}")
+    print(f"Line: {frame.f_lineno}")
+
+    # Walk the call stack:
+    frame_iter = frame
+    while frame_iter:
+        print(f"  {frame_iter.f_code.co_name}:{frame_iter.f_lineno}")
+        frame_iter = frame_iter.f_back   # parent frame
 
 def outer():
-    x = 42
-    inner()
+    inner(42)
 
 outer()
-# Current function: inner
-# Caller function:  outer
-# Current locals:   {'frame': ..., 'caller': ...}
-# Line number:      ...
+
+# Modern API:
+for frame_info in inspect.stack():
+    print(f"{frame_info.function}:{frame_info.lineno} in {frame_info.filename}")
 ```
 
-Frame attributes:
-- `f_code` — the code object being executed
-- `f_locals` — a dict of local variables (materialized on demand; reading this is expensive)
-- `f_globals` — the global namespace dict
-- `f_builtins` — the builtins dict
-- `f_lineno` — current line number
-- `f_back` — the calling frame (linked list of frames = call stack)
-- `f_lasti` — index of last bytecode instruction executed
+### Frame Object Attributes
 
-### LOAD_FAST vs LOAD_GLOBAL — Frame-Level Details
+```python
+import sys
+
+def demo(a, b, c=3, *args, **kwargs):
+    frame = sys._getframe()
+
+    print(frame.f_code)          # code object
+    print(frame.f_locals)        # dict of local vars (snapshot)
+    print(frame.f_globals)       # module globals dict (live reference)
+    print(frame.f_builtins)      # builtins dict
+    print(frame.f_back)          # parent frame
+    print(frame.f_lineno)        # current line number
+    print(frame.f_lasti)         # index of last bytecode instruction
+
+    # f_locals is a SNAPSHOT — writing to it doesn't change actual locals
+    # (for optimized functions with LOAD_FAST — locals live in C arrays)
+    frame.f_locals['a'] = 999    # has no effect in optimized frames!
+    print(a)   # still original value
+
+    # ctypes can force-write local variables (CPython internals hack):
+    import ctypes
+    ctypes.pythonapi.PyFrame_LocalsToFast(ctypes.py_object(frame), ctypes.c_int(0))
+
+demo(1, 2)
+```
+
+### Call Stack Introspection
+
+```python
+import traceback
+import sys
+
+def a():
+    b()
+
+def b():
+    c()
+
+def c():
+    # Full traceback as string:
+    tb = ''.join(traceback.format_stack())
+
+    # As structured data:
+    for frame, lineno in traceback.walk_stack(None):
+        print(f"{frame.f_code.co_name}:{lineno}")
+
+    # Extract call chain:
+    chain = []
+    frame = sys._getframe()
+    while frame:
+        chain.append((frame.f_code.co_name, frame.f_lineno))
+        frame = frame.f_back
+    return chain
+
+a()
+```
+
+### Frame Object Lifecycle and Memory
+
+```python
+import gc
+import sys
+
+def memory_demo():
+    frame = sys._getframe()
+    ref_count = sys.getrefcount(frame)
+    print(f"Frame refcount: {ref_count}")   # at least 2 (frame var + getrefcount arg)
+
+    # Frames are reference-counted:
+    # - The running thread holds a reference to the current frame
+    # - f_back chains hold references (child → parent)
+    # - Tracing/debugging tools may hold additional references
+
+# Reference cycles via frames:
+def cycle_demo():
+    frame = sys._getframe()
+    d = {'frame': frame}   # dict holds frame; frame.f_locals holds dict
+    # frame → f_locals → d → frame — reference cycle!
+    # CPython's cyclic GC handles this
+
+# Python 3.11+: frames are allocated on the C stack (not heap) for common cases:
+# - "inline frames" for simple function calls
+# - Heap allocation only when frame is retained (debugging, tracing)
+```
+
+### Argument Passing: Positional, Keyword, *args, **kwargs
 
 ```python
 import dis
 
-def function_with_locals():
-    x = 1         # STORE_FAST — writes to frame->localsplus[0]
-    y = x + 1    # LOAD_FAST 0 — reads frame->localsplus[0] (no dict lookup)
-    return y
+def f(a, b, c=3, *args, d=10, **kwargs):
+    pass
 
-dis.dis(function_with_locals)
-# LOAD_FAST is an array index into the frame's locals array — O(1), no hashing
-```
-
-The `localsplus` array in a frame is pre-allocated based on `co_nlocals` at compile time. Local variable access is array indexing, not dict lookup. This is why Python functions are faster than expected for local variable access.
-
-**`f_locals` vs `localsplus`:** Reading `frame.f_locals` triggers materialization — CPython copies `localsplus` entries into a dict. Modifying `f_locals` does NOT update the actual locals (localsplus) in running frame. Use `ctypes` or frame-patching to actually change locals at runtime.
-
-### How a Function Call Works (CALL opcode)
-
-```python
-import dis
-
-def add(a, b):
-    return a + b
-
+# See how call sites compile:
 def caller():
-    return add(1, 2)
+    f(1, 2, c=4, *[5, 6], d=20, **{'extra': 7})
 
 dis.dis(caller)
+# LOAD_GLOBAL   f
+# BUILD_LIST    [5, 6] → CALL_INTRINSIC_1 (list_to_tuple)
+# Various LOAD_CONSTs, BUILD_MAP, etc.
+# CALL_FUNCTION_EX  (with extra args + kwargs)
+
+# Python 3.11+ calling conventions:
+# CALL replaces CALL_FUNCTION, CALL_FUNCTION_KW, CALL_METHOD
+# KW_NAMES: for keyword-only calls — pre-packaged keyword names tuple
+
+# inspect.signature: introspect function signature at runtime
+import inspect
+
+sig = inspect.signature(f)
+for name, param in sig.parameters.items():
+    print(f"{name}: kind={param.kind.name}, default={param.default}")
 ```
 
-Typical output (3.12):
-```
-RESUME           0
-LOAD_GLOBAL      1 (NULL + add)    # loads function object + NULL sentinel
-LOAD_CONST       1 (1)
-LOAD_CONST       2 (2)
-CALL             2                 # 2 positional args
-RETURN_VALUE
-```
-
-What `CALL` does internally:
-1. Pops `n` arguments from the stack.
-2. Pops the callable (function object).
-3. Checks if it's a Python function (`PyCFunction` vs `PyFunctionObject`).
-4. For Python functions: creates a new `PyFrameObject`, sets `f_code`, `f_back`, copies arguments into `localsplus`.
-5. Pushes the new frame and enters the eval loop recursively.
-
-### Frame Lifecycle and Python 3.11 Frame Optimization
-
-**Pre-3.11:** Each function call heap-allocated a full `PyFrameObject`. Frequent function calls meant heavy allocator pressure.
-
-**3.11+:** The internal frame representation was split:
-- `_PyInterpreterFrame` — a lightweight struct stored on the C stack or in a per-thread frame cache. Not directly accessible as a Python object.
-- `PyFrameObject` — the Python-visible frame object. Created lazily only when code accesses `sys._getframe()`, `traceback`, etc.
-
-This change made function calls ~15-20% faster by eliminating the heap allocation for most calls.
+### `inspect.currentframe()` vs `sys._getframe()`
 
 ```python
-# This triggers full frame object creation (slower path):
-def with_frame_access():
-    f = sys._getframe()   # forces PyFrameObject creation
-    return f
+import inspect, sys
 
-# This uses lightweight internal frame only (faster):
-def without_frame_access():
-    return 42
+def compare():
+    f1 = inspect.currentframe()   # high-level, None if no C stack support
+    f2 = sys._getframe()          # low-level, CPython-specific
+
+    # Both return the same frame object:
+    print(f1 is f2)   # True
+
+    # inspect.currentframe() is more portable (returns None in Jython)
+    # sys._getframe(n) takes a depth argument — skips n levels up
+
+    # Preferred for production: inspect.stack() with limit:
+    for fi in inspect.stack(context=1):
+        print(fi.function)   # context=1: only 1 source line per frame (faster)
+
+compare()
 ```
-
-### Generators and Frames
-
-Generators are essentially suspended frames:
-
-```python
-def counter(n):
-    for i in range(n):
-        yield i
-
-gen = counter(3)
-print(gen.gi_frame)          # the suspended frame
-print(gen.gi_frame.f_locals) # {'n': 3, 'i': 0} after first yield
-next(gen)                    # advances frame, updates f_locals
-print(gen.gi_frame.f_locals) # {'n': 3, 'i': 1}
-```
-
-When a generator yields, `_PyInterpreterFrame` is preserved — the frame is not destroyed, just suspended. `next()` resumes from where `yield` left.
 
 ---
 
 ## Interview Questions
 
-### Q1: What is `sys._getframe()` and when would you legitimately use it in production code?
+### Q1: What is a frame object and what does it contain?
 
-**Model answer:**  
-`sys._getframe(depth)` returns the frame object `depth` levels up the call stack. The leading underscore signals it's an implementation detail.
+**Model answer:**
+A `PyFrameObject` (exposed as `frame` in Python) is the runtime execution context for a single function call. It's created when a function is called and destroyed (or GC'd) when the function returns.
 
-**Legitimate production uses:**
-1. **Logging with automatic context** — some logging frameworks capture the caller's filename/line:
-```python
-import sys, logging
+Contents:
+- `f_code`: the `code` object being executed
+- `f_locals`: dict of local variables (snapshot for optimized frames)
+- `f_globals`: module's global namespace dict
+- `f_builtins`: builtins namespace
+- `f_back`: the calling frame (parent)
+- `f_lineno`: current source line being executed
+- `f_lasti`: last bytecode instruction index
+- Value stack: array of `PyObject*` for intermediate computation results
 
-def log(msg, level=logging.INFO):
-    frame = sys._getframe(1)
-    caller_file = frame.f_code.co_filename
-    caller_line = frame.f_lineno
-    logging.getLogger().log(level, f"[{caller_file}:{caller_line}] {msg}")
-```
+In Python 3.11+: frames can be "lightweight" — allocated on the C eval loop stack instead of the heap, making function calls significantly cheaper. The frame is only promoted to a heap-allocated object when `sys._getframe()`, `inspect.currentframe()`, or a tracer captures it.
 
-2. **Dependency injection / auto-wiring** — frameworks inspect the caller's locals to auto-resolve dependencies (Flask-style `g` objects).
+### Q2: Why is `frame.f_locals` a snapshot rather than a live view of locals?
 
-3. **Test assertion helpers** — `pytest`'s `assert` rewriting, `unittest.mock.patch` use frame inspection.
+**Model answer:**
+For optimized functions (those with `CO_OPTIMIZED` flag, i.e., most functions), local variables are stored in a C array (`localsplus` in `PyFrameObject`) indexed by position — this is what `LOAD_FAST`/`STORE_FAST` use. There's no Python dict.
 
-**When to avoid:** Anything performance-sensitive. `sys._getframe()` forces frame object creation and is O(depth) to walk. Also, it's fragile across Python implementations (PyPy, Jython may not support it the same way).
-
-### Q2: How does Python implement closures at the frame/cell level?
-
-**Model answer:**  
-Closures use **cell objects** — a wrapper around a variable that is shared between the enclosing scope's frame and the inner function's code object.
+`frame.f_locals` is computed on demand by `PyFrame_FastToLocalsWithError()` which copies the C array values into a dict snapshot. Writing to this dict doesn't update the C array — changes are lost.
 
 ```python
-def outer():
-    x = 10  # x is a "cell variable" — stored in a Cell object, not localsplus directly
+import sys, ctypes
 
-    def inner():
-        return x  # LOAD_DEREF — reads through the cell object
-
-    return inner
-
-import dis
-dis.dis(outer)
-# MAKE_CELL  0 (x)    — wraps x in a Cell object in outer's frame
-# ...
-# MAKE_FUNCTION       — creates inner with a reference to the Cell
-
-dis.dis(outer())      # the inner function
-# LOAD_DEREF 0 (x)   — dereferences the Cell to get x's value
-```
-
-The cell object is the shared reference point. If `outer` modifies `x` after returning `inner` but before `inner` is called, `inner` sees the new value (late binding). The cell ensures that both frames point to the same storage location.
-
-```python
-def outer():
+def demonstrate():
     x = 1
-    def inner():
-        return x
-    x = 2     # modifies the cell
-    return inner
+    frame = sys._getframe()
 
-print(outer()())  # 2 — inner sees the modified cell value
+    frame.f_locals['x'] = 999   # modifies the dict snapshot, not the C array
+    print(x)   # still 1!
+
+    # Force the dict back into the C array (CPython internal hack):
+    ctypes.pythonapi.PyFrame_LocalsToFast(ctypes.py_object(frame), ctypes.c_int(0))
+    print(x)   # 999 — now updated
+
+# This is why debuggers (pdb) can't easily modify local variables mid-execution.
+# The `locals()` built-in has the same limitation.
 ```
 
-### Q3: Why is reading `frame.f_locals` expensive? How do profilers minimize this cost?
+### Q3: How do Python function calls differ in cost from C function calls?
 
-**Model answer:**  
-`frame.f_locals` is not stored as a dict — locals are in `localsplus`, an array. When you read `f_locals`, CPython calls `PyEval_GetFrameLocals()` which:
-1. Allocates a new `dict`.
-2. Iterates all `co_varnames` entries.
-3. Copies each non-NULL local into the dict.
-4. Returns the dict.
+**Model answer:**
+A C function call: push arguments on the stack, jump to the function's address — a few nanoseconds.
 
-This is O(n_locals) per access and always allocates a new dict.
+A CPython function call:
+1. Look up the function object (LOAD_GLOBAL or LOAD_FAST)
+2. Push arguments onto the value stack
+3. Allocate a `PyFrameObject` (heap allocation — Python 3.10 and earlier, often on heap in 3.11+)
+4. Set up `f_locals`, `f_globals`, `f_back`
+5. Set up the value stack for the new frame
+6. Enter the eval loop for the new frame
+7. On return: restore the parent frame, decrement refcounts
 
-Profilers minimize this by:
-1. **Not reading `f_locals` at all** — most profilers only need `f_code`, `f_lineno`, and `f_back`, which are cheap.
-2. **Using `sys.setprofile`/`sys.settrace` judiciously** — only hooking on `call`/`return` events, not `line` events.
-3. **Sampling instead of tracing** — `py-spy` samples the C-level stack without touching Python frame objects at all.
-4. **`ctypes` frame access** — some profilers read `localsplus` directly via ctypes to avoid dict creation.
-
-### Q4: What is `co_stacksize` and why does it matter?
-
-**Model answer:**  
-`co_stacksize` is the maximum depth of the value stack that the bytecode needs at any point during execution. It's computed by the compiler's stack depth analyzer and used to pre-allocate the frame's stack space.
+Total overhead: ~100-1000ns per call (vs ~1ns for a C call). This is why tight Python loops with many small function calls can be slow, and why `list(map(fn, data))` can be faster than an explicit `for` loop (reduces Python-level function calls for simple transforms).
 
 ```python
-def complex():
-    return (1 + 2) * (3 + 4)
+import timeit
 
-print(complex.__code__.co_stacksize)  # 3
-# Stack needs: push 1, push 2, add (→1), push 3, push 4, add (→1), multiply
-# Max depth = 3 items at peak
+def identity(x):
+    return x
+
+# Function call overhead:
+t = timeit.timeit(lambda: identity(42), number=1_000_000)
+print(f"Python call: {t:.3f}s / 1M calls = {t*1000:.1f}ms/1M")
+
+# vs no call:
+x = 42
+t = timeit.timeit(lambda: x + 0, number=1_000_000)
+print(f"No call:     {t:.3f}s / 1M calls = {t*1000:.1f}ms/1M")
 ```
 
-Why it matters:
-1. **Memory pre-allocation** — the frame allocates `co_stacksize` slots for the value stack. Overflowing this is prevented by the compiler's analysis.
-2. **Safety** — CPython validates that bytecode doesn't overflow `co_stacksize` when loading a `.pyc` file.
-3. **Tools** — if you're writing custom bytecode (e.g., in a compiler targeting Python), you must compute `co_stacksize` correctly or the interpreter will raise `SystemError`.
+Python 3.11 reduced function call overhead by ~15-20% via specialized call opcodes and frame inlining.
 
-### Q5: How does Python handle tail calls? Does it optimize them?
+### Q4: How does `inspect.stack()` work and what are the performance implications?
 
-**Model answer:**  
-CPython does **not** optimize tail calls. Every function call, including tail calls, creates a new frame and is pushed onto the call stack. This means recursive Python code can hit `RecursionError` at the default limit of 1000 frames.
+**Model answer:**
+`inspect.stack()` calls `sys._getframe()` to get the current frame, then walks `frame.f_back` up to the top of the call stack, collecting `FrameInfo` named tuples.
+
+For each frame, it reads source lines (by calling `linecache.getlines(filename, module_globals)` — which may read from disk or cache). Each frame object accessed by Python code is kept alive as long as the reference exists.
+
+Performance implications:
+- **`inspect.stack()` is slow:** it may read source files from disk and processes every frame on the stack.
+- **Avoid in hot paths:** never call in a tight loop or critical performance path.
+- **Stack depth matters:** `inspect.stack()` walks the ENTIRE stack — a deep recursion stack is expensive to inspect.
+- **`context=0` or `context=1`:** use to limit source line reading.
 
 ```python
-import sys
-print(sys.getrecursionlimit())  # 1000
+import inspect, timeit
 
-def tail_recursive_sum(n, acc=0):
-    if n == 0:
-        return acc
-    return tail_recursive_sum(n - 1, acc + n)  # not optimized
+def shallow():
+    return inspect.stack(context=0)   # 0 source lines = fastest
 
-tail_recursive_sum(999)   # OK
-tail_recursive_sum(1000)  # RecursionError: maximum recursion depth exceeded
+def deep():
+    return inspect.stack(context=3)   # 3 source lines per frame = slow
+
+# Profiling:
+t1 = timeit.timeit(shallow, number=1000)
+t2 = timeit.timeit(deep, number=1000)
+print(f"context=0: {t1:.3f}s")
+print(f"context=3: {t2:.3f}s")
 ```
 
-Workarounds:
-1. **Increase limit:** `sys.setrecursionlimit(10000)` — risky; each frame uses C stack space; OS has limits.
-2. **Explicit stack/iteration:** Convert recursion to explicit loop with a stack.
-3. **Trampolining:** A technique where recursive functions return thunks (callables) instead of calling directly, and an outer trampoline loop calls them iteratively.
+### Q5: What's the difference between `f_locals`, `locals()`, and `vars()`?
+
+**Model answer:**
+All three give access to a namespace dict, but with subtle differences:
 
 ```python
-def trampoline(fn, *args):
-    result = fn(*args)
-    while callable(result):
-        result = result()
-    return result
+def demo():
+    x = 1
+    y = 2
 
-def sum_trampoline(n, acc=0):
-    if n == 0:
-        return acc
-    return lambda: sum_trampoline(n - 1, acc + n)  # return thunk
+    # locals(): built-in, returns a COPY of f_locals snapshot
+    l = locals()
+    l['z'] = 99    # modifying l does NOT affect actual locals
+    print('z' in dir())   # False — z was never a real local
 
-print(trampoline(sum_trampoline, 100_000))  # works; no recursion limit hit
+    # frame.f_locals: same snapshot as locals() in the same frame
+    import sys
+    frame = sys._getframe()
+    print(frame.f_locals is locals())   # may be True or False depending on Python version
+
+    # vars(): with no argument, same as locals()
+    print(vars() == locals())   # True
+
+# At module level:
+x = 1
+print(locals() is globals())   # True! At module level, locals = globals
+print(vars() is globals())     # True
+
+# vars(obj): returns obj.__dict__
+class C:
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+
+c = C()
+print(vars(c))           # {'a': 1, 'b': 2} — same as c.__dict__
+vars(c)['c'] = 3        # DOES work — modifies __dict__ directly
+print(c.c)               # 3 — unlike f_locals, __dict__ is the real store
 ```
+
+At module or class scope, `locals()` returns the actual namespace dict (live). In a function body, it returns a snapshot (dead copy). This inconsistency is a known Python wart.
 
 ---
 
 ## Gotcha Follow-ups
 
-**"If I modify `frame.f_locals` inside `sys.settrace`, does the running code see the changes?"**  
-No — `f_locals` is a snapshot dict, not live storage. Modifications to it don't affect the actual `localsplus` array. This is a frequent source of confusion when writing debuggers. The `ctypes` hack (`ctypes.pythonapi.PyFrame_LocalsToFast`) can write the dict back into `localsplus`, but it's fragile and implementation-specific. Python 3.13 is adding `FrameLocalsProxy` to make this safer.
+**"Does holding a reference to `frame.f_back` cause memory leaks?"**
+Yes — frame objects form a reference chain. If you store a frame reference (e.g., in a traceback or exception), the entire call stack up to that point stays in memory. Exception objects attached to locals create a well-known reference cycle: `except Exception as e:` creates `e.__traceback__` which holds the frame, which holds `f_locals`, which may hold the exception itself. Python 3 clears `e` after the `except` block to break this cycle, but you should also `del e` or `e = None` in long-lived exception handling code.
 
-**"What's the maximum call stack depth in CPython and what determines it?"**  
-`sys.getrecursionlimit()` (default 1000) limits Python frame depth. But the actual limit is the C stack size (OS-determined, typically 8MB). Each Python frame takes C stack space for the eval loop recursion. `sys.setrecursionlimit(10000)` might work or might segfault depending on the frame sizes and OS stack limit. Production code should avoid deep Python recursion entirely.
+**"Can you modify a running frame's local variables from a debugger?"**
+pdb and other debuggers use `sys.settrace` to intercept execution, then modify `frame.f_locals` and call `PyFrame_LocalsToFast()` via ctypes to actually update the C-level local array. This works but is fragile — the specialized adaptive interpreter (Python 3.11+) can specialize LOAD_FAST to not even consult the locals array in some cases.
 
 ---
 
 ## Under the Hood
 
-`PyFrameObject` (Python-visible) is defined in `Include/cpython/frameobject.h`. The internal `_PyInterpreterFrame` (3.11+) is in `Include/internal/pycore_frame.h`. Key fields:
-
-```c
-struct _PyInterpreterFrame {
-    PyCodeObject *f_code;
-    struct _PyInterpreterFrame *previous;   // f_back equivalent
-    PyObject *f_funcobj;
-    PyObject *f_globals;
-    PyObject *f_builtins;
-    PyObject *f_locals;
-    PyObject **localsplus;                  // start of locals/stack array
-    int f_lasti;
-    // ...
-};
-```
-
-The `localsplus` array holds both locals and the value stack in the same allocation — locals at lower indices, stack growing upward. This was a Python 3.11 optimization; previously they were separate allocations.
+`PyFrameObject` (`Include/cpython/frameobject.h`) in Python 3.11+ is split: `_PyInterpreterFrame` (the "inline frame" — lives on the C stack for common cases) and `PyFrameObject` (the "Python frame" — heap-allocated, created lazily when accessed from Python). The eval loop (`Python/ceval.c: _PyEval_EvalFrameDefault()`) manipulates `_PyInterpreterFrame` directly via pointer arithmetic. `sys._getframe()` materializes a `PyFrameObject` from the `_PyInterpreterFrame`. Local variable storage is in `frame->localsplus` — a C array of `PyObject*` pointers (NULL for uninitialized). `LOAD_FAST` is: `owner = frame->localsplus[oparg]; if (owner == NULL) goto unbound_local_error;`.

@@ -2,312 +2,356 @@
 
 ## Concept
 
-Python 3.11 introduced the **Specializing Adaptive Interpreter** (PEP 659). Instead of interpreting every opcode generically, the interpreter watches how opcodes are used and replaces them with specialized, faster versions when patterns are stable. This gave CPython a ~25% overall speedup in 3.11 and further gains in 3.12.
+Python 3.11 introduced the specializing adaptive interpreter (SAI) — a form of inline caching that makes the CPython eval loop self-optimizing. Frequently-executed bytecode instructions "specialize" based on the actual types observed, replacing generic opcodes with faster type-specific variants. This is the primary reason Python 3.11 achieved a ~25% average speedup over 3.10.
 
-### How It Works
+### The Core Idea
 
-Every "adaptive" opcode starts as a **generic** version (e.g., `BINARY_OP`). After the opcode is executed a fixed number of times (currently 8), the interpreter checks what types were actually used and replaces the opcode with a specialized version:
+```python
+# When CPython sees:
+x = obj.attr
 
+# It emits the generic opcode:
+# LOAD_ATTR  (slow: calls tp_getattro, checks descriptor protocol, etc.)
+
+# After ~8 executions with the same type:
+# LOAD_ATTR_INSTANCE_VALUE  (fast: direct offset read from instance dict)
+# or LOAD_ATTR_MODULE  (fast: dict lookup in module namespace)
+# or LOAD_ATTR_SLOT  (fast: read from __slots__ array)
 ```
-BINARY_OP (generic)
-   ↓ after 8 calls with int+int
-BINARY_OP_ADD_INT (specialized)
-   ↓ if types change (deoptimize)
-BINARY_OP (generic, but with counter reset)
-```
 
-The specialized opcode avoids the general type dispatch, calling `PyLong_Add` directly instead of going through `PyObject_Add` → type lookup → `nb_add` method resolution.
-
-### Seeing Specialization in Action
+### Observing Specialization with `dis`
 
 ```python
 import dis
 
-def add_ints(a: int, b: int) -> int:
-    return a + b
+class Point:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
 
-# Before any calls — generic opcode:
-dis.dis(add_ints)
-# BINARY_OP 0 (+) + CACHE CACHE ...
+def distance(p: Point) -> float:
+    return (p.x ** 2 + p.y ** 2) ** 0.5
 
-# Run with integers many times:
-for _ in range(100):
-    add_ints(1, 2)
+# Before specialization (first few calls):
+dis.dis(distance)
+# LOAD_FAST   0 (p)
+# LOAD_ATTR   0 (x)         ← generic
+# ...
 
-# After specialization (use dis.dis with show_caches=True):
-dis.dis(add_ints, show_caches=True)
-# BINARY_OP_ADD_INT + (inline cache showing observed types)
+# After ~8 calls with Point instances:
+p = Point(3, 4)
+for _ in range(10):
+    distance(p)
+
+# The bytecode is now SPECIALIZED in-place:
+# LOAD_ATTR_INSTANCE_VALUE  0  ← reads directly from instance dict offset
+
+# Python 3.12 uses 'adaptive' format — dis shows both original and specialized:
+# LOAD_ATTR + adaptive cache entries
 ```
 
-**Note:** The specialized opcodes are visible via `dis.dis(fn, show_caches=True, adaptive=True)`. Without `adaptive=True`, you see the original unspecialized bytecode.
-
-### Specialized Opcodes (3.11/3.12 selection)
-
-| Generic Opcode | Specialized Version | Condition |
-|---------------|---------------------|-----------|
-| `BINARY_OP +` | `BINARY_OP_ADD_INT` | Both operands are `int` |
-| `BINARY_OP +` | `BINARY_OP_ADD_FLOAT` | Both operands are `float` |
-| `BINARY_OP +` | `BINARY_OP_ADD_UNICODE` | Both operands are `str` |
-| `LOAD_ATTR` | `LOAD_ATTR_INSTANCE_VALUE` | Attribute is in `__dict__` slot |
-| `LOAD_ATTR` | `LOAD_ATTR_SLOT` | Attribute is a `__slots__` slot |
-| `LOAD_ATTR` | `LOAD_ATTR_MODULE` | Object is a module |
-| `CALL` | `CALL_PY_EXACT_ARGS` | Calling a Python function with correct arg count |
-| `CALL` | `CALL_BUILTIN_O` | Calling a C builtin with one arg |
-| `LOAD_GLOBAL` | `LOAD_GLOBAL_MODULE` | Name found in globals dict (not builtins) |
-| `COMPARE_OP` | `COMPARE_OP_INT` | Comparing two ints |
-| `FOR_ITER` | `FOR_ITER_LIST` | Iterating a list |
-| `STORE_SUBSCR` | `STORE_SUBSCR_LIST_INT` | `list[int] = value` |
-
-### Deoptimization
-
-When types change, the specialized opcode is replaced back with the generic version. This is called **deoptimization**:
+### Specialized Opcodes (Python 3.11-3.12)
 
 ```python
-def versatile(a, b):
-    return a + b
+# Key specializations:
+# LOAD_ATTR → LOAD_ATTR_INSTANCE_VALUE (instance attribute at known offset)
+#           → LOAD_ATTR_MODULE (module global via dict)
+#           → LOAD_ATTR_SLOT (__slots__ at known index)
+#           → LOAD_ATTR_WITH_HINT (instance dict with cached key hash)
 
-# Call with ints — specializes to BINARY_OP_ADD_INT:
-for _ in range(20):
-    versatile(1, 2)
+# STORE_ATTR → STORE_ATTR_INSTANCE_VALUE
+#            → STORE_ATTR_SLOT
 
-# Now call with strings — deoptimizes:
-versatile("hello", " world")
-# Back to generic BINARY_OP
+# BINARY_OP → BINARY_OP_ADD_INT (int + int, no type check)
+#           → BINARY_OP_ADD_FLOAT (float + float)
+#           → BINARY_OP_MULTIPLY_INT
 
-# Calls with mixed types prevent stable specialization
+# CALL → CALL_PY_EXACT_ARGS (Python function with exact arg count)
+#      → CALL_PY_WITH_DEFAULTS
+#      → CALL_BUILTIN_CLASS (type()/int()/etc.)
+#      → CALL_BUILTIN_FAST (C function with no kwargs)
+#      → CALL_METHOD_DESCRIPTOR_FAST
+
+# COMPARE_OP → COMPARE_OP_INT (int comparison: pointer-level for small ints)
+#            → COMPARE_OP_FLOAT
+#            → COMPARE_OP_STR
+
+# LOAD_GLOBAL → LOAD_GLOBAL_MODULE (with cached dict version)
+#             → LOAD_GLOBAL_BUILTIN (with cached dict version)
+
+import opcode
+# See all specialized opcodes:
+specialized = [name for name in dir(opcode) if 'ADAPTIVE' in name or
+               any(x in name for x in ['_INT', '_FLOAT', '_STR', '_MODULE', '_SLOT', '_INSTANCE'])]
 ```
 
-**Architectural implication:** Functions called with multiple types never stabilize. For hot paths, type consistency is valuable — polymorphic hot functions are slower than monomorphic ones.
-
-### CACHE Entries
-
-Each adaptive opcode is followed by inline cache entries (shown as `CACHE` in `dis.dis(show_caches=True)`):
+### How Specialization Works Internally
 
 ```python
-dis.dis(add_ints, show_caches=True)
-```
-```
-RESUME           0
-LOAD_FAST        0 (a)
-LOAD_FAST        1 (b)
-BINARY_OP        0 (+)
-    CACHE                  # 4 bytes: specialization counter
-    CACHE                  # 4 bytes: left operand type version
-    CACHE                  # 4 bytes: right operand type version  
-    CACHE                  # 4 bytes: (unused / padding)
-RETURN_VALUE
+# The mechanism (simplified):
+# 1. Generic opcode starts with a counter (quickening counter)
+# 2. Counter decrements on each execution
+# 3. At 0: the specializer runs, observing actual types
+# 4. If type is stable and optimizable: replace opcode with specialized version
+#    in the SAME bytecode array (in-place mutation of the code object's co_code_adaptive)
+# 5. Specialized opcode includes a type "guard" (fast check that types match)
+# 6. On mismatch: "deoptimize" back to generic or try a different specialization
+
+# This is why:
+# - Python 3.11 is faster for monomorphic code (one type)
+# - Less speedup for polymorphic code (many different types per opcode)
+# - Warmup is needed: first 8+ iterations are not specialized
+
+def benchmark_warmup_effect():
+    import timeit
+
+    class MyClass:
+        x: int = 0
+
+    obj = MyClass()
+
+    # "Cold" call — no specialization yet:
+    def access_cold():
+        return obj.x
+
+    # "Warm" call — after specialization:
+    def warmup():
+        for _ in range(20):
+            access_cold()
+    warmup()
+
+    t_cold = timeit.timeit(access_cold, number=10)  # new function, cold
+    t_warm = timeit.timeit(access_cold, number=10)  # second run, warm
+    print(f"Cold: {t_cold:.6f}s, Warm: {t_warm:.6f}s")
+    # Warm is typically 20-40% faster for attribute-heavy code
 ```
 
-These `CACHE` slots are part of the bytecode array but are not instructions — they're treated as data by the specializer. They store:
-1. A counter tracking how many times the generic version ran before specializing.
-2. Type version tags for the observed operand types.
-3. Pointer caches for attribute lookup (method address, class version).
-
-### Impact on Code Patterns
+### Implications for Benchmarking
 
 ```python
-# GOOD: consistent types → stable specialization
-def process_numbers(values: list[int]) -> int:
-    total = 0
-    for v in values:
-        total += v    # BINARY_OP_ADD_INT after warmup
-    return total
+import timeit
 
-# BAD: mixed types → repeated deoptimization
-def process_mixed(values):
-    total = 0
-    for v in values:
-        total += v    # never specializes if v is sometimes int, sometimes float
-    return total
+def benchmark_correctly():
+    """Correct way to benchmark in Python 3.11+."""
 
-# For process_mixed with floats: cast explicitly
-def process_float(values: list[float]) -> float:
-    total = 0.0
-    for v in values:
-        total += v    # BINARY_OP_ADD_FLOAT — stable
-    return total
+    def my_function(x):
+        return x * x + 2 * x + 1
+
+    # WRONG: first run includes specialization overhead:
+    t = timeit.timeit(lambda: my_function(5), number=100)
+    # Reported time is misleadingly slow (specialization overhead in early iterations)
+
+    # CORRECT: warmup first, then measure:
+    # Warmup (drives specialization):
+    for _ in range(20):
+        my_function(5)
+
+    # Now measure (specialized):
+    t = timeit.timeit(lambda: my_function(5), number=1_000_000)
+    print(f"Specialized time: {t:.3f}s")
+
+    # CORRECT: use setup= to warmup before timing:
+    setup = """
+def f(x):
+    return x * x
+for _ in range(20): f(5)  # warmup
+"""
+    t = timeit.timeit("f(5)", setup=setup, number=1_000_000)
+    print(f"Warmed up: {t:.3f}s")
+```
+
+### When Specialization Fails (Deoptimization)
+
+```python
+# Specialization assumes type stability.
+# Type changes cause deoptimization:
+
+def polymorphic_add(a, b):
+    return a + b   # BINARY_OP_ADD_INT would specialize for int + int
+
+# But call with mixed types:
+polymorphic_add(1, 2)      # int + int → specializes for int
+polymorphic_add(1.0, 2.0)  # float + float → deoptimizes, tries float specialization
+polymorphic_add("a", "b")  # str + str → deoptimizes again
+
+# Final state: "megamorphic" — stays generic, no specialization
+# The opcode records a "miss counter" — too many misses → give up on specializing
+
+# Design implication: type-stable code benefits most from Python 3.11+
+# Use type annotations and Protocol to make type stability explicit and enforced
 ```
 
 ---
 
 ## Interview Questions
 
-### Q1: What is the specializing adaptive interpreter and why was it faster than previous CPython optimization attempts?
+### Q1: What is the specializing adaptive interpreter and how does it differ from a JIT?
 
-**Model answer:**  
-Previous attempts at speeding up CPython (e.g., `psyco`, `unladen swallow`) relied on JIT compilation — generating native machine code for hot functions. These required complex infrastructure, had high warmup costs, and were abandoned.
+**Model answer:**
+The specializing adaptive interpreter is a form of "inline caching" within the eval loop — not a JIT compiler. The key differences:
 
-The specializing adaptive interpreter takes a middle path:
-- No JIT compilation — stays in the bytecode interpreter.
-- Instead, replaces generic bytecodes with specialized variants that skip type dispatch for known-stable types.
-- Low overhead: specialization happens lazily after 8 executions, falls back gracefully on type change.
-- No warmup penalty in the traditional sense — cold code runs at generic (old CPython) speed; hot code gets specialized.
+| | SAI (Python 3.11+) | JIT (PyPy, HotSpot) |
+|-|-------------------|---------------------|
+| Output | Specialized bytecode (still interpreted) | Native machine code |
+| Scope | Single opcode at a time | Entire hot loops/traces |
+| Compilation step | No — opcodes replaced in-place | Yes — compile to native |
+| Warmup | ~8 iterations | Hundreds to thousands |
+| Memory | Minimal (per-opcode cache) | Significant (JIT code cache) |
+| Speedup | 1.2-2x typical | 5-100x for CPU-heavy code |
 
-The speedup (~25% in 3.11) comes from eliminating the two most expensive parts of bytecode execution: the type dispatch (looking up `nb_add` on the type object) and the Python function call overhead (`CALL_PY_EXACT_ARGS` can bypass the general `tp_call` dispatch).
+The SAI avoids the overhead of re-checking types on every execution by caching the result of the type check inside the opcode itself. If the cached type matches, the fast path executes. If not, it deoptimizes.
 
-### Q2: How does class attribute access specialization work? What is a "type version tag"?
+A JIT (like PyPy's trace-based JIT) compiles entire control-flow paths to machine code, eliminating the interpreter overhead entirely. CPython 3.13 is adding an experimental JIT (copy-and-patch) that will layer on top of the SAI.
 
-**Model answer:**  
-`LOAD_ATTR_INSTANCE_VALUE` is the specialized opcode for loading an instance attribute that lives in the instance's `__dict__` (not overridden by a descriptor). The inline cache stores:
-1. The **type version tag** — a monotonically-increasing integer associated with a class. It increments whenever the class is modified (attribute added, method replaced).
-2. The **dict offset** — the offset of the instance's `__dict__` pointer in the C struct.
-3. The **slot index** — index into the instance dict's compact values array.
+### Q2: Which Python operations benefit most from the SAI and which don't?
 
-When `LOAD_ATTR_INSTANCE_VALUE` executes:
-1. Check `obj.__class__.__version_tag == cached_version_tag` — fast integer comparison.
-2. If match: directly read `obj.__dict__[cached_index]` — no string lookup.
-3. If mismatch (class was modified, or different class): deoptimize to generic `LOAD_ATTR`.
+**Model answer:**
+**High benefit:**
+- Attribute access on instances of the same type (`obj.attr` where `obj` is always `Point`)
+- Integer arithmetic in tight loops (`a + b` where both are always `int`)
+- Method calls on known types (`list.append`, `dict.get`)
+- Global/builtin lookups (cached module dict version tag)
+
+**Low benefit:**
+- Polymorphic code (different types at the same opcode)
+- Code running only a few times (never reaches specialization threshold)
+- I/O-bound code (SAI optimizes CPU, not I/O)
+- Operations already O(n) or worse (algorithmic complexity dominates)
 
 ```python
-class Point:
-    def __init__(self, x, y):
-        self.x = x    # x lives in instance __dict__
-        self.y = y
+# High benefit: type-stable, computation-heavy
+def stable_sum(n: int) -> int:
+    total = 0
+    for i in range(n):
+        total += i   # always int + int → BINARY_OP_ADD_INT
+    return total
 
-p = Point(1, 2)
-
-def get_x(point):
-    return point.x    # LOAD_ATTR → specializes to LOAD_ATTR_INSTANCE_VALUE
-
-# Run 10+ times with Point instances:
-for _ in range(20):
-    get_x(Point(i, i))
-
-# Now modifying Point invalidates the type version:
-Point.z = 0   # increments Point.__version_tag__
-# get_x will deoptimize next call, then re-specialize
+# Low benefit: polymorphic
+def polymorphic_sum(items):
+    total = 0
+    for item in items:
+        total += item   # item could be int, float, Decimal — no stable specialization
+    return total
 ```
 
-### Q3: Does specialization work across different instances of the same class?
+### Q3: How should you structure benchmarks to correctly account for the SAI?
 
-**Model answer:**  
-Yes — specialization is per **type**, not per instance. The `LOAD_ATTR_INSTANCE_VALUE` cache stores the type's version tag, not a pointer to a specific instance. As long as all objects passed to the function are instances of the same class (and the class hasn't changed), the specialization is stable.
+**Model answer:**
+Always warm up before measuring. The specialization threshold is ~8 executions per opcode, but complex functions may need more:
+
+```python
+import timeit, time
+
+def function_under_test(x):
+    return x.attr_a + x.attr_b * x.attr_c
+
+class MyObj:
+    attr_a = 1
+    attr_b = 2
+    attr_c = 3
+
+obj = MyObj()
+
+# BAD: no warmup
+t_bad = timeit.timeit(lambda: function_under_test(obj), number=100_000)
+
+# GOOD: explicit warmup
+WARMUP = 50  # safely above specialization threshold
+for _ in range(WARMUP):
+    function_under_test(obj)
+
+t_good = timeit.timeit(lambda: function_under_test(obj), number=100_000)
+
+print(f"No warmup: {t_bad:.4f}s")
+print(f"Warmed up: {t_good:.4f}s")
+# t_bad may be 5-20% higher due to specialization overhead in first iterations
+
+# pytest-benchmark handles this automatically via its calibration phase
+```
+
+### Q4: How does the SAI interact with dynamic Python features like `setattr` and `__dict__` modification?
+
+**Model answer:**
+The SAI uses type version tags to validate cached specializations. When a class changes (attribute added/removed, `setattr` on the class), the version tag increments — invalidating ALL specializations that cached that type.
 
 ```python
 class Config:
-    def __init__(self, value):
-        self.value = value
+    debug = False
+    timeout = 30
 
-def read_value(cfg: Config):
-    return cfg.value  # specializes for Config type
+def read_config(cfg: Config) -> tuple:
+    return cfg.debug, cfg.timeout   # specializes to LOAD_ATTR_INSTANCE_VALUE
 
-# Different instances — all still specialized:
-configs = [Config(i) for i in range(1000)]
-for c in configs:
-    read_value(c)  # all benefit from LOAD_ATTR_INSTANCE_VALUE
+cfg = Config()
+
+# After warmup, reads are specialized:
+for _ in range(50):
+    read_config(cfg)
+
+# Now modify the class (adds a new attribute):
+Config.log_level = "INFO"   # invalidates ALL specializations for Config!
+
+# Next call to read_config triggers re-specialization (8+ calls again)
+read_config(cfg)
+
+# Practical implication: don't add attributes to classes at runtime in production.
+# Define all attributes in __init__ (or __slots__) to avoid invalidating specializations.
+
+# Similarly: setting instance attributes after construction:
+obj = Config()
+for _ in range(50):
+    obj.debug  # specialized
+
+obj.new_attr = True   # may invalidate instance-specific specializations
 ```
 
-But if you pass instances of different classes:
+### Q5: What is the "quickening" mechanism and how does CPython track specialization state per code object?
+
+**Model answer:**
+"Quickening" is the process of replacing generic opcodes with specialized variants. In Python 3.11+:
+
+1. Each instruction has an 8-bit counter stored in `_Py_OPCODE_STATS`.
+2. On each execution of a specializable instruction, the counter decrements.
+3. At 0: `_Py_Specialize_LoadAttr()` (or the appropriate specializer) is called.
+4. If specialization succeeds: the opcode in `co_code_adaptive` is replaced with the specialized opcode (e.g., `LOAD_ATTR_INSTANCE_VALUE`), along with cache entries (inline cache) immediately following.
+5. If the type guard fails at runtime: `SPECIALIZATION_FAIL` → either try another specialization or mark as "superinstructions" or "polymorphic".
+
 ```python
-class AltConfig:
-    def __init__(self, value):
-        self.value = value
+import dis, sys
 
-read_value(Config(1))
-read_value(AltConfig(2))  # different type → deoptimize → never stabilizes
+class T:
+    x = 1
+
+obj = T()
+
+def f():
+    return obj.x
+
+# Warmup:
+for _ in range(30):
+    f()
+
+# Inspect specialization:
+dis.dis(f)
+# In Python 3.12: shows 'cache' entries after LOAD_ATTR showing the specialized type
+
+# The adaptive copy is separate from the "canonical" bytecode:
+# f.__code__.co_code  ← original (unspecialized)
+# f.__code__._co_code_adaptive  ← specialized version (internal, not public API)
 ```
-
-Polymorphic call sites (multiple types) prevent stable specialization. This is a real performance consideration for generic utility functions.
-
-### Q4: How do you measure whether specialization is actually happening in your code?
-
-**Model answer:**  
-Three approaches:
-
-**1. `dis` with adaptive flag:**
-```python
-import dis
-
-def fn(a, b):
-    return a + b
-
-for _ in range(20):
-    fn(1, 2)
-
-dis.dis(fn, adaptive=True)
-# Shows actual specialized opcodes in the bytecode
-```
-
-**2. `sys.monitoring` (Python 3.12+) or `sys.settrace` to count opcode specializations:**
-```python
-# Rough approach: time before/after warmup
-import time
-
-def bench(fn, *args, n=1000):
-    for _ in range(n):  # warmup
-        fn(*args)
-    start = time.perf_counter()
-    for _ in range(n):
-        fn(*args)
-    return time.perf_counter() - start
-
-def add(a, b): return a + b
-
-cold = bench(add, 1, 2, n=10)    # before specialization
-warm = bench(add, 1, 2, n=10000) # after specialization
-print(f"Cold: {cold:.6f}s, Warm: {warm:.6f}s")
-```
-
-**3. `perf` or `py-spy` flame graphs** — specialized code appears as fewer cycles in the type dispatch path.
-
-### Q5: What types of code patterns prevent or defeat specialization?
-
-**Model answer:**  
-
-**1. Polymorphic inputs (most common):**
-```python
-def process(x):
-    return x + x  # ints sometimes, strings sometimes — never specializes
-```
-
-**2. Modifying classes frequently:**
-```python
-for i in range(1000):
-    MyClass.attr = i  # increments version tag each time, defeats caching
-```
-
-**3. Very short-lived functions (rarely called):**
-```python
-def compute_once():
-    return expensive()
-# Called once — specialization threshold (8 calls) never reached
-```
-
-**4. Functions with many early exits:**
-```python
-def guarded(x):
-    if not isinstance(x, int):  # type check on every call
-        return None
-    return x + 1
-# isinstance() itself can be specialized, but the guard path prevents
-# BINARY_OP from seeing consistent types
-```
-
-**5. Accessing attributes on multiple types in one function:**
-```python
-def dual_access(obj):
-    return obj.name + obj.value
-# If obj is sometimes TypeA, sometimes TypeB, LOAD_ATTR never stabilizes
-```
-
-**Architectural guidance:** For performance-critical inner loops, keep types consistent, avoid frequent class modification, and prefer separate specialized functions over one polymorphic function.
 
 ---
 
 ## Gotcha Follow-ups
 
-**"Does specialization persist across garbage collection cycles?"**  
-Specialization is stored in the bytecode array of the code object. Code objects live as long as they're referenced (function object holds a reference). GC does not reset specialization. However, specialization can be reset when: (a) the function is redefined (new code object created), (b) the module is reloaded, or (c) a related class is modified.
+**"Does specialization persist across runs (in .pyc files)?"**
+No — specialization is done at runtime in memory. The `.pyc` file stores the original unspecialized bytecode. Specialization happens from scratch on every interpreter startup. This is by design: the specialization is based on the actual types seen at runtime, which may differ between runs (different inputs, different import order).
 
-**"Can specialization cause incorrect results if types change mid-operation?"**  
-No — the specializer always checks the type version tag before using cached data. If the check fails, it falls back to the generic opcode, which is always correct. The worst case is a performance regression (back to generic speed), never a correctness error. This property (correct under all type transitions) was the main design constraint that made the specializer safe to add without extensive formal verification.
+**"Does the SAI work with subclasses?"**
+Partially — specialization includes a type guard. If `LOAD_ATTR_INSTANCE_VALUE` is specialized for `Point`, it includes a check that `type(obj) is Point`. A `ColoredPoint(Point)` would fail this check (it's a subclass, not the exact same type), causing deoptimization and re-specialization. Python 3.12 improved some specializations to work with subclasses via `LOAD_ATTR_WITH_HINT` variants.
 
 ---
 
 ## Under the Hood
 
-The specialization machinery is in `Python/specialize.c`. Key function: `_Py_Specialize_BinaryOp()` — called after the generic `BINARY_OP` runs 8 times. It inspects the types of the operands via the inline cache and writes the specialized opcode directly into the bytecode array (in-place modification of the `co_code` bytes).
-
-The counter is decremented each time the generic opcode runs. At zero, `_Py_Specialize_*` is called. If specialization succeeds, the opcode is replaced and counter reset. If it fails (types too complex), the opcode transitions to a "megamorphic" state that doesn't attempt specialization again.
-
-Python 3.13+ introduces "Tier 2" optimization (stacks of specialized operations translated to a higher-level IR for further optimization). This is the foundation for an eventual tracing JIT in Python 3.14+.
+The specializing adaptive interpreter lives in `Python/specialize.c` (specializer functions) and `Python/ceval.c` (specialized opcode handlers). Each specializable instruction reserves "inline cache" slots immediately following it in the bytecode array — these slots store cached type pointers, dict version tags, and offsets. `_PyAdaptiveEntry` stores a `counter` and `index`. The type version tag (`tp_version_tag` in `PyTypeObject`) is a global monotonically-increasing counter; each modification to a type (attribute add/remove) gets a new tag. A specialization caches the tag; before using the cache, it verifies `type->tp_version_tag == cached_tag`. `Python/typeobject.c: type_modified_unlocked()` increments the tag on any type modification.

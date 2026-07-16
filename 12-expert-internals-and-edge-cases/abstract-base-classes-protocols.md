@@ -2,357 +2,386 @@
 
 ## Concept
 
-Python offers three mechanisms for defining interfaces and checking type compatibility. Choosing the right one is an architectural decision with real impact on coupling, flexibility, and IDE/type-checker support.
+Python provides three distinct mechanisms for expressing interface contracts, each with different trade-offs around coupling, runtime checkability, and static analysis support. Understanding when to use each is a Staff/Architect-level skill.
 
-### Duck Typing (Implicit Interface)
-
-No explicit interface declaration. If an object has the required methods, it works.
+### Duck Typing — The Default
 
 ```python
-def process(item):
-    item.start()   # relies on duck typing — any object with .start() works
-    data = item.read()
-    item.close()
-    return data
+# No formal interface — just call the method and handle AttributeError:
+def process(obj):
+    """Works with anything that has a .read() method."""
+    return obj.read()
 
-class File:
-    def start(self): ...
-    def read(self): ...
-    def close(self): ...
+# EAFP (Easier to Ask Forgiveness than Permission):
+def send(obj):
+    try:
+        data = obj.read()
+    except AttributeError:
+        raise TypeError(f"{type(obj).__name__} must have a read() method")
 
-class Socket:
-    def start(self): ...
-    def read(self): ...
-    def close(self): ...
-
-process(File())    # works
-process(Socket())  # works
-# No type annotation, no explicit interface — pure duck typing
+# LBYL (Look Before You Leap):
+def send_lbyl(obj):
+    if not hasattr(obj, 'read'):
+        raise TypeError(f"{type(obj).__name__} must have a read() method")
+    return obj.read()
 ```
 
-**Pros:** Maximum flexibility. No coupling between caller and callees.  
-**Cons:** No IDE support, no static analysis, runtime-only errors, no explicit contract.
-
-### Abstract Base Classes (ABCs) — Nominal Typing
-
-`abc.ABC` + `@abstractmethod` creates an explicit interface that must be inherited:
+### ABCs — Nominal Typing with Runtime Enforcement
 
 ```python
 from abc import ABC, abstractmethod
-from typing import Any
 
-class Processable(ABC):
+class Serializer(ABC):
     @abstractmethod
-    def start(self) -> None: ...
+    def serialize(self, obj) -> bytes: ...
 
+    @abstractmethod
+    def deserialize(self, data: bytes): ...
+
+    def round_trip(self, obj):
+        """Concrete method using the abstract interface."""
+        return self.deserialize(self.serialize(obj))
+
+class JSONSerializer(Serializer):
+    def serialize(self, obj) -> bytes:
+        import json
+        return json.dumps(obj).encode()
+
+    def deserialize(self, data: bytes):
+        import json
+        return json.loads(data)
+
+# Concrete methods are inherited:
+s = JSONSerializer()
+assert s.round_trip({"key": "value"}) == {"key": "value"}
+
+# Cannot instantiate with missing abstract methods:
+class Incomplete(Serializer):
+    def serialize(self, obj) -> bytes:
+        return b""
+    # Missing deserialize
+
+try:
+    Incomplete()   # TypeError: Can't instantiate abstract class
+except TypeError as e:
+    print(e)
+
+# ABC isinstance — nominal:
+print(isinstance(s, Serializer))  # True (subclass)
+print(isinstance({"key": 1}, Serializer))  # False (no inheritance)
+```
+
+### Virtual Subclasses — ABCs with `__subclasshook__`
+
+```python
+from abc import ABC, abstractmethod
+
+class Readable(ABC):
     @abstractmethod
     def read(self) -> bytes: ...
 
-    @abstractmethod
-    def close(self) -> None: ...
-
     @classmethod
     def __subclasshook__(cls, C):
-        """Optional: allow implicit registration via duck typing check."""
-        if cls is Processable:
-            # Duck-type check: does C have all required methods?
-            return all(
-                any(method in B.__dict__ for B in C.__mro__)
-                for method in ('start', 'read', 'close')
-            )
+        """Structural check: any class with .read() counts."""
+        if cls is Readable:
+            if any("read" in B.__dict__ for B in C.__mro__):
+                return True  # virtual subclass — no inheritance required
         return NotImplemented
 
-class File(Processable):
-    def start(self) -> None: pass
-    def read(self) -> bytes: return b""
-    def close(self) -> None: pass
+class FileStream:
+    """Has .read() but doesn't inherit Readable."""
+    def read(self) -> bytes:
+        return b"data"
 
-# Attempting to instantiate an ABC without all abstract methods:
-class Incomplete(Processable):
-    def start(self) -> None: pass
-    # Missing read() and close()
+print(isinstance(FileStream(), Readable))   # True — via __subclasshook__
+print(issubclass(FileStream, Readable))     # True
 
-Incomplete()  # TypeError: Can't instantiate abstract class Incomplete
-              # with abstract methods close, read
+# Manual virtual subclass registration:
+class OldStyleReader:
+    def read(self):
+        return b""
 
-# Virtual subclasses (register without inheriting):
-class Legacy:  # doesn't inherit Processable
-    def start(self): pass
-    def read(self): return b""
-    def close(self): pass
-
-Processable.register(Legacy)
-print(isinstance(Legacy(), Processable))  # True — registered
-print(issubclass(Legacy, Processable))    # True
+Readable.register(OldStyleReader)   # explicitly declare compatibility
+print(isinstance(OldStyleReader(), Readable))  # True
 ```
 
-### Protocols (Structural Typing — PEP 544, Python 3.8+)
-
-`typing.Protocol` defines an interface that any class with the right structure satisfies — no inheritance or registration needed:
+### Protocols — Structural Typing Without Inheritance
 
 ```python
 from typing import Protocol, runtime_checkable
 
 @runtime_checkable
-class Processable(Protocol):
-    def start(self) -> None: ...
-    def read(self) -> bytes: ...
-    def close(self) -> None: ...
+class Drawable(Protocol):
+    def draw(self) -> None: ...
+    def resize(self, factor: float) -> None: ...
 
-class File:  # NO inheritance from Processable
-    def start(self) -> None: pass
-    def read(self) -> bytes: return b""
-    def close(self) -> None: pass
+class Circle:
+    """No Drawable inheritance — but satisfies the protocol structurally."""
+    def draw(self) -> None:
+        print("Drawing circle")
 
-class Socket:
-    def start(self) -> None: pass
-    def read(self) -> bytes: return b""
-    def close(self) -> None: pass
+    def resize(self, factor: float) -> None:
+        self.radius *= factor
 
-def process(item: Processable) -> bytes:  # type-checked against Protocol
-    item.start()
-    data = item.read()
-    item.close()
-    return data
+class Square:
+    def draw(self) -> None:
+        print("Drawing square")
 
-process(File())     # ✓ mypy/pyright: structurally compatible
-process(Socket())   # ✓ mypy/pyright: structurally compatible
+    def resize(self, factor: float) -> None:
+        self.side *= factor
 
-# Runtime check (only with @runtime_checkable):
-print(isinstance(File(), Processable))  # True
-print(isinstance(42, Processable))      # False
+def render_all(shapes: list[Drawable]) -> None:
+    for shape in shapes:
+        shape.draw()
 
-# Without @runtime_checkable, isinstance raises TypeError
+# Works with any class that has draw() and resize():
+render_all([Circle(), Square()])
+
+# Runtime check (only checks method presence, not signatures):
+print(isinstance(Circle(), Drawable))   # True
+print(isinstance("not a shape", Drawable))  # False
+
+# Static check: mypy/pyright verify the full signature at call sites
 ```
 
-### Key Comparison
-
-| Aspect | Duck Typing | ABC | Protocol |
-|--------|------------|-----|---------|
-| Explicit contract | None | Yes (inheritance) | Yes (structural) |
-| Type checker support | Minimal | Good | Excellent |
-| `isinstance()` | Not applicable | Yes | Yes (with @runtime_checkable) |
-| Coupling | None | Tight (must inherit) | Loose (structural match) |
-| Third-party class support | Yes (implicit) | Via `.register()` | Yes (no action needed) |
-| Error detection | Runtime | Instantiation time | Static analysis |
-| Use in stdlib | `collections.abc` | Widely | New (3.8+) |
-
-### Collections ABCs and Protocol
-
-The `collections.abc` module provides ABCs for built-in protocols:
+### Comparison: ABC vs Protocol
 
 ```python
-from collections.abc import Sequence, Mapping, Iterable, Iterator, Callable
+from abc import ABC, abstractmethod
+from typing import Protocol
 
-# Check if an object implements the sequence protocol:
-print(isinstance([1, 2, 3], Sequence))  # True — list has __getitem__, __len__
-print(isinstance("hello", Sequence))    # True
-print(isinstance({}, Sequence))         # False — dict is a Mapping, not Sequence
+# ABC approach: requires inheritance
+class Repository(ABC):
+    @abstractmethod
+    def get(self, id: int): ...
+    @abstractmethod
+    def save(self, entity) -> None: ...
 
-# Implementing a custom Sequence:
-class Fibonacci(Sequence):
-    def __init__(self, n):
-        self._data = self._compute(n)
+class PostgresRepo(Repository):   # MUST inherit
+    def get(self, id: int): ...
+    def save(self, entity) -> None: ...
 
-    def _compute(self, n):
-        a, b = 0, 1
-        result = []
-        for _ in range(n):
-            result.append(a)
-            a, b = b, a + b
-        return result
+# Protocol approach: structural — no inheritance required
+class Repository(Protocol):
+    def get(self, id: int): ...
+    def save(self, entity) -> None: ...
 
-    def __getitem__(self, idx):  # abstract — must implement
+class PostgresRepo:   # no inheritance needed
+    def get(self, id: int): ...
+    def save(self, entity) -> None: ...
+
+# Practical choice matrix:
+# - Third-party class you don't control → Protocol (can't make it inherit)
+# - Your own class hierarchy → ABC (enforces implementation, provides concrete methods)
+# - Plugin interface → entry_points + Protocol (ABC if you ship a base class)
+# - Want default method implementations → ABC (Protocol has no default impls)
+```
+
+### `collections.abc` — Built-in ABCs
+
+```python
+from collections.abc import (
+    Sequence,      # __getitem__ + __len__ → free: __contains__, __iter__, __reversed__, index, count
+    MutableSequence,  # + __setitem__, __delitem__, insert → free: append, clear, reverse, extend, pop, remove, __iadd__
+    Mapping,       # __getitem__ + __len__ + __iter__ → free: __contains__, keys, items, values, get, __eq__
+    MutableMapping,   # + __setitem__, __delitem__ → free: pop, popitem, clear, update, setdefault
+    Iterable,      # __iter__
+    Iterator,      # __iter__ + __next__
+    Callable,      # __call__
+    Sized,         # __len__
+)
+
+class SortedList(MutableSequence):
+    """Implements 5 methods, gets 12 free."""
+    def __init__(self):
+        self._data = []
+
+    def __getitem__(self, idx):
         return self._data[idx]
 
-    def __len__(self):           # abstract — must implement
+    def __setitem__(self, idx, val):
+        self._data[idx] = val
+        self._data.sort()
+
+    def __delitem__(self, idx):
+        del self._data[idx]
+
+    def __len__(self):
         return len(self._data)
-    # Mixin methods (count, index, __contains__, __iter__, __reversed__)
-    # provided for free by Sequence ABC
+
+    def insert(self, idx, val):
+        self._data.insert(idx, val)
+        self._data.sort()
+
+sl = SortedList()
+sl.append(3)
+sl.append(1)
+sl.append(2)
+print(list(sl))  # [1, 2, 3] — sorted; append/extend/pop all work free
 ```
 
 ---
 
 ## Interview Questions
 
-### Q1: When would you use Protocol over ABC at a Staff/Architect level?
+### Q1: When would you choose an ABC over a Protocol for a public API?
 
-**Model answer:**  
-**Use Protocol when:**
-- Integrating with third-party classes you don't control (they can't inherit your ABC).
-- The interface is defined by behavior, not lineage — structural typing is more natural.
-- You want maximum flexibility: any class with the right methods works, even existing ones.
-- Building library code that should be easy to mock/stub in tests without inheriting base classes.
+**Model answer:**
+ABCs when:
+1. **You provide concrete default implementations** that subclasses inherit. `collections.abc.MutableSequence` gives `append`, `extend`, `pop`, etc. for free — implementing only 5 abstract methods.
+2. **You want to prevent instantiation of incomplete implementations** — `abstractmethod` raises `TypeError` at instantiation if any abstract method is missing.
+3. **You ship a base class to subclass** — SDK users inherit `MyBasePlugin` to get free functionality and be automatically compatible.
+4. **You use `register()` for virtual subclasses** — explicitly marking third-party classes as compatible without modifying them.
 
-**Use ABC when:**
-- You want instantiation-time enforcement of interface completeness (ABC raises `TypeError` immediately; Protocol only catches violations with a static type checker).
-- You provide mixin behavior via concrete methods in the ABC (see `collections.abc.Sequence` providing `count`, `index` for free).
-- You need `isinstance()` checks in library code that must work without `@runtime_checkable` overhead.
-- The class hierarchy IS the domain model — e.g., `BaseException` hierarchy where lineage is semantically meaningful.
+Protocols when:
+1. **You don't control the implementing class** — can't require it to inherit anything.
+2. **You want zero coupling** — the Protocol lives in your library; implementors don't need to import it.
+3. **Structural typing is enough** — any object with the right shape works.
+4. **Static analysis is the primary enforcement** — mypy/pyright check Protocol compliance without runtime overhead.
 
-**General principle for libraries:** Prefer Protocol for input parameters (maximally flexible for callers). Use ABC for output types or when you need to provide shared implementation.
+### Q2: What does `collections.abc.MutableSequence` give you for free when you implement 5 abstract methods?
 
-### Q2: What is `__subclasshook__` and why does `collections.abc.Iterable` use it?
+**Model answer:**
+`MutableSequence` requires `__getitem__`, `__setitem__`, `__delitem__`, `__len__`, `insert`. In return, it provides mixin implementations of:
+- `append(v)` → `insert(len(self), v)`
+- `clear()` → `del self[i]` for all i
+- `reverse()` → in-place reversal using `__getitem__`/`__setitem__`
+- `extend(other)` → `append()` for each
+- `pop(idx=-1)` → get + delete
+- `remove(v)` → find + delete
+- `__iadd__(other)` → extend
+- `__contains__(v)` → linear scan via `__getitem__`
+- `__iter__()` → index-based iteration
+- `__reversed__()` → reverse index-based iteration
+- `index(v)` → linear scan
+- `count(v)` → linear scan
 
-**Model answer:**  
-`__subclasshook__` is a classmethod on an ABC that's called by `isinstance()` and `issubclass()` before checking the class registry. If it returns `True` or `False`, that's used. If it returns `NotImplemented`, normal ABC checks proceed.
+This is the power of the ABC pattern for data structures: implement the minimal primitives, get the full standard interface.
 
-`collections.abc.Iterable.__subclasshook__`:
+### Q3: How does `__subclasshook__` make an ABC behave structurally like a Protocol?
+
+**Model answer:**
+`__subclasshook__(cls, C)` is called by `isinstance()` and `issubclass()` BEFORE checking the MRO. If it returns `True`, the class is treated as a virtual subclass — without inheritance or `register()`.
+
 ```python
-@classmethod
-def __subclasshook__(cls, C):
-    if cls is Iterable:
-        return _check_methods(C, "__iter__")
-    return NotImplemented
+from abc import ABC
+
+class Closeable(ABC):
+    @classmethod
+    def __subclasshook__(cls, C):
+        if cls is Closeable:
+            # Check if any class in C's MRO defines 'close':
+            if any("close" in B.__dict__ for B in C.__mro__):
+                return True
+        return NotImplemented   # fall back to normal MRO check
+
+class FileWrapper:
+    def close(self):
+        ...
+
+print(isinstance(FileWrapper(), Closeable))  # True — via __subclasshook__
+print(isinstance(open("/dev/null"), Closeable))  # True — io.IOBase has close()
 ```
 
-This means any class with `__iter__` is considered an `Iterable`, even without inheriting from it:
-```python
-from collections.abc import Iterable
+This is how `collections.abc.Iterable` works: any class with `__iter__` is an `Iterable` without inheriting it. The difference from Protocol: it's an ABC runtime check, still uses `isinstance()`, but is opt-in per ABC (not automatic structural typing like Protocol).
 
-class MyContainer:
-    def __iter__(self):
-        return iter([1, 2, 3])
+### Q4: What's the performance difference between `isinstance(obj, SomeABC)` and `isinstance(obj, SomeProtocol)`?
 
-print(isinstance(MyContainer(), Iterable))  # True — via __subclasshook__
-print(issubclass(MyContainer, Iterable))    # True
-```
+**Model answer:**
+ABC `isinstance`: O(depth of MRO) — fast MRO lookup or O(1) via `_abc_registry` cache (C implementation in `Modules/_abc.c`). After the first check for a given type, the result is cached in `_abc_cache` or `_abc_negative_cache`.
 
-This is how duck typing and ABCs are reconciled in the stdlib. The ABC defines the structural check; `__subclasshook__` makes it automatic. Without `__subclasshook__`, you'd need `Iterable.register(MyContainer)` explicitly.
-
-### Q3: What's the performance difference between Protocol structural checks and ABC isinstance checks?
-
-**Model answer:**  
-`isinstance()` with a `@runtime_checkable` Protocol is **slower** than with an ABC:
-
-- **ABC:** Looks up `type(obj).__mro__` and checks if the ABC is in it, or if the type was registered. Both are O(1) amortized (class identity checks, dict lookups). 
-- **Protocol with `@runtime_checkable`:** Iterates through all methods defined in the Protocol and checks that `obj` has them. O(m) where m is the number of methods in the Protocol.
+`@runtime_checkable` Protocol `isinstance`: O(m) where m = number of protocol methods — `hasattr()` check for each method. No caching. For a Protocol with 10 methods, it's 10 attribute lookups on every `isinstance()` call.
 
 ```python
 import timeit
-from abc import ABC, abstractmethod
 from typing import Protocol, runtime_checkable
-
-class ABCInterface(ABC):
-    @abstractmethod
-    def method(self): ...
+from collections.abc import Iterable
 
 @runtime_checkable
-class ProtoInterface(Protocol):
-    def method(self): ...
+class MyProtocol(Protocol):
+    def method_a(self) -> None: ...
+    def method_b(self) -> int: ...
+    def method_c(self) -> str: ...
 
-class Impl(ABCInterface):
-    def method(self): pass
+class ConcreteClass:
+    def method_a(self): pass
+    def method_b(self): return 0
+    def method_c(self): return ""
 
-obj = Impl()
-print(timeit.timeit(lambda: isinstance(obj, ABCInterface), number=1_000_000))
-print(timeit.timeit(lambda: isinstance(obj, ProtoInterface), number=1_000_000))
-# Protocol isinstance is typically 3-10x slower
+obj = ConcreteClass()
+lst = [1, 2, 3]
+
+# ABC (collections.abc): fast after first check
+t1 = timeit.timeit(lambda: isinstance(lst, Iterable), number=100_000)
+
+# Protocol: O(m) every time
+t2 = timeit.timeit(lambda: isinstance(obj, MyProtocol), number=100_000)
+
+print(f"ABC: {t1:.4f}s")       # ~0.005s
+print(f"Protocol: {t2:.4f}s")  # ~0.020s — 4x slower per check
 ```
 
-**Practical advice:** Don't use `isinstance(obj, Protocol)` in hot paths. Use it for validation at system boundaries (e.g., validating input to a public API). In static type-checking contexts (function signatures), Protocol has zero runtime cost — the check is purely at analysis time.
+For hot paths: check once, cache the result. Or use ABC if the overhead matters.
 
-### Q4: How do Protocols handle generic types (e.g., `Comparable`, `Sortable`)?
+### Q5: How do you create a class that passes `isinstance()` checks for multiple ABCs without inheriting from all of them?
 
-**Model answer:**  
-```python
-from typing import Protocol, TypeVar
-
-T = TypeVar('T')
-
-class Comparable(Protocol[T]):
-    def __lt__(self, other: T) -> bool: ...
-    def __eq__(self, other: object) -> bool: ...
-
-class Sortable(Protocol):
-    def __lt__(self: T, other: T) -> bool: ...
-
-def sort_items(items: list[Comparable]) -> list[Comparable]:
-    return sorted(items)
-
-# Works with any class implementing __lt__ and __eq__:
-@dataclass
-class Point:
-    x: float
-    y: float
-    def __lt__(self, other: 'Point') -> bool:
-        return (self.x, self.y) < (other.x, other.y)
-
-sort_items([Point(1, 2), Point(0, 3)])  # type-checks correctly
-```
-
-`Self` type (Python 3.11+) in Protocols:
-```python
-from typing import Protocol, Self
-
-class Addable(Protocol):
-    def __add__(self, other: Self) -> Self: ...
-    # Self means "the same concrete type as the implementing class"
-
-class Vector:
-    def __add__(self, other: 'Vector') -> 'Vector': ...
-    # Vector satisfies Addable[Vector]
-```
-
-### Q5: When does ABC's mixin inheritance provide real value over Protocols?
-
-**Model answer:**  
-ABCs can provide **concrete mixin methods** that implementing classes get for free. This is the primary advantage over Protocols (which only define the interface, no implementation):
+**Model answer:**
+Use `register()` for each ABC, or implement `__subclasshook__` in a custom metaclass, or provide the required methods (for structural ABCs like `Iterable`):
 
 ```python
-from abc import ABC, abstractmethod
-from typing import Iterator
+from collections.abc import Sized, Iterable, Container
 
-class Sequence(ABC):
-    @abstractmethod
-    def __getitem__(self, index): ...  # must implement
+class VirtualCollection:
+    """Passes ABC checks without explicit inheritance."""
+    def __len__(self): return 0
+    def __iter__(self): return iter([])
+    def __contains__(self, x): return False
 
-    @abstractmethod
-    def __len__(self) -> int: ...       # must implement
+obj = VirtualCollection()
 
-    # Mixin methods — provided by ABC, don't need to implement:
-    def __contains__(self, value) -> bool:
-        for item in self:
-            if item == value:
-                return True
-        return False
+# These ABCs use __subclasshook__ to check for the relevant dunders:
+print(isinstance(obj, Sized))      # True — has __len__
+print(isinstance(obj, Iterable))   # True — has __iter__
+print(isinstance(obj, Container))  # True — has __contains__
 
-    def __iter__(self) -> Iterator:
-        i = 0
-        while True:
-            try:
-                yield self[i]
-            except IndexError:
-                return
-            i += 1
+# For ABCs without __subclasshook__, use register():
+from collections.abc import Mapping
 
-    def __reversed__(self) -> Iterator:
-        for i in reversed(range(len(self))):
-            yield self[i]
+class ConfigProxy:
+    """Acts like a Mapping but has a custom __init__."""
+    def __getitem__(self, key): ...
+    def __len__(self): return 0
+    def __iter__(self): return iter([])
 
-    def index(self, value, start=0, stop=None) -> int:
-        ...  # implementation using __getitem__ and __len__
+Mapping.register(ConfigProxy)
+print(isinstance(ConfigProxy(), Mapping))  # True
 
-    def count(self, value) -> int:
-        return sum(1 for item in self if item == value)
+# Caveat: register() does NOT verify the implementation
+# Missing __getitem__ would still register successfully — silent bug!
 ```
-
-By implementing just `__getitem__` and `__len__`, you get `in`, `for`, `reversed()`, `.index()`, `.count()` for free. This is why `collections.abc.Sequence` is worth inheriting for custom sequence types. Protocol can't provide this — it's structural only.
 
 ---
 
 ## Gotcha Follow-ups
 
-**"Can a class satisfy a Protocol's structural check while still being semantically incompatible?"**  
-Yes — structural typing checks method names and signatures, not behavior. A class with `def read(self) -> bytes` satisfies the `Readable` Protocol even if `read()` always returns corrupt data or raises unexpectedly. Protocols define the interface contract but cannot enforce behavioral correctness. This is why Protocols are best for technical interoperability (does it have these methods?) while ABCs with documentation and tests are better for enforcing semantic contracts.
+**"Can a Protocol have non-method attributes?"**
+Yes — Protocol can specify class variables and instance attributes:
+```python
+class HasName(Protocol):
+    name: str       # instance attribute — checked structurally
+    MAX: ClassVar[int]  # class variable
 
-**"What's the `__protocol_attrs__` attribute on a Protocol?"**  
-In Python 3.12+, `Protocol.__protocol_attrs__` is a frozenset of the names of methods/attributes that define the protocol (excluding inherited ones from `Protocol` itself and `object`). This is used by `isinstance()` checks with `@runtime_checkable` to know which attributes to check. Before 3.12, this was computed ad hoc and was slower.
+class Foo:
+    name = "foo"     # satisfies the protocol
+    MAX = 100
+```
+However, `@runtime_checkable` only checks for methods (callable attributes via `hasattr`), not data attributes. Type checkers (mypy/pyright) do check attribute presence statically.
+
+**"Does `ABC.register()` make `issubclass()` return True?"**
+Yes — both `isinstance()` and `issubclass()` are affected by `register()`. But `__mro__` of the registered class is NOT modified — it doesn't appear as an ancestor in the MRO. This is "virtual" subclassing: the class knows it satisfies the contract, but the hierarchy is unchanged.
 
 ---
 
 ## Under the Hood
 
-ABCs are implemented in `Lib/abc.py` (Python-level metaclass `ABCMeta`) backed by `_abc` (C module in Python 3.4+). The `ABCMeta.__instancecheck__` and `__subclasscheck__` methods implement the registry and `__subclasshook__` logic. The ABC registry is stored as a `WeakSet` in `ABCMeta.__subclasses__` — instances are automatically removed when classes are GC'd.
-
-`typing.Protocol`'s runtime checking is in `typing.py`. The `@runtime_checkable` decorator sets a `_is_runtime_protocol` flag. `Protocol.__instancecheck__` then iterates `__protocol_attrs__` and calls `hasattr(obj, attr)` for each. This is why Protocol isinstance is slower than ABC isinstance — it's O(n_methods) vs O(1) for ABCs.
+The ABC mechanism (`Modules/_abc.c`, `Lib/abc.py`): `ABCMeta.__instancecheck__` calls `__subclasshook__` first, then checks `_abc_cache` (positive hits) and `_abc_negative_cache` (negative hits). Cache entries are `weakref`s — cleared when the class is GC'd. `abstractmethod` sets `__isabstractmethod__ = True` on the function; `ABCMeta.__new__` collects all methods with this flag into `__abstractmethods__` on the class. `object.__new__` checks `cls.__abstractmethods__` and raises `TypeError` if non-empty. Protocol (`typing.py: Protocol`): `@runtime_checkable` installs a custom `__instancecheck__` that uses `hasattr()` for each name in `Protocol.__protocol_attrs__`.

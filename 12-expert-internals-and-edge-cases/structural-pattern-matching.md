@@ -2,85 +2,78 @@
 
 ## Concept
 
-Python 3.10 introduced `match`/`case` (PEP 634). It is NOT a simple `switch` statement — it's a powerful structural decomposition tool that operates on the shape and content of objects. Understanding how it differs from `if/elif` chains and what `__match_args__` enables is essential for using it correctly at scale.
+Structural pattern matching (`match`/`case`, PEP 634, Python 3.10+) is not just a switch statement — it matches against the structure and content of objects, sequences, mappings, and class instances. Understanding what it compiles to and when it actually destructures is essential.
 
-### Basic Syntax and Pattern Types
+### Basic Patterns
 
 ```python
-def describe(command):
+# Literal pattern:
+def http_status(code: int) -> str:
+    match code:
+        case 200:
+            return "OK"
+        case 404:
+            return "Not Found"
+        case 500:
+            return "Internal Server Error"
+        case _:   # wildcard — matches anything, binds nothing
+            return f"Unknown {code}"
+
+# Capture pattern — binds the value to a name:
+def describe(value):
+    match value:
+        case 0:
+            print("zero")
+        case n if n > 0:   # guard expression after pattern
+            print(f"positive: {n}")
+        case n:
+            print(f"negative: {n}")   # n is bound here
+```
+
+### Sequence Pattern
+
+```python
+def process_command(command: list[str]) -> str:
     match command:
-        case "quit":
-            return "Quitting"
-
-        case "go" | "move":           # OR pattern
-            return "Moving"
-
-        case ["go", direction]:       # sequence pattern — destructures list/tuple
+        case ["quit"]:
+            return "Exiting"
+        case ["go", direction]:            # binds 'direction'
             return f"Going {direction}"
+        case ["go", direction, speed]:     # binds two variables
+            return f"Going {direction} at {speed}"
+        case ["look", *where]:             # star pattern — rest of list
+            return f"Looking at {where}"
+        case [first, *rest]:               # first element + rest
+            return f"Command: {first}, args: {rest}"
+        case _:
+            return f"Unknown: {command}"
 
-        case {"action": action, "target": target}:  # mapping pattern
-            return f"Action: {action} on {target}"
-
-        case _:                       # wildcard — always matches, no binding
-            return "Unknown command"
+print(process_command(["go", "north"]))      # Going north
+print(process_command(["go", "east", "fast"]))  # Going east at fast
+print(process_command(["look", "left", "right"]))  # Looking at ['left', 'right']
 ```
 
-### Pattern Types
+### Mapping Pattern
 
 ```python
-value = some_object
+def handle_event(event: dict) -> str:
+    match event:
+        case {"type": "click", "button": button, "x": x, "y": y}:
+            return f"Click {button} at ({x}, {y})"
+        case {"type": "keydown", "key": key}:
+            return f"Key pressed: {key}"
+        case {"type": "resize", **rest}:    # **rest captures remaining keys
+            return f"Resize event, extra: {rest}"
+        case {"type": str(event_type)}:     # class pattern inside mapping
+            return f"Unknown event type: {event_type}"
+        case _:
+            return "Malformed event"
 
-match value:
-    # Literal patterns:
-    case 42: ...
-    case "hello": ...
-    case True: ...
-    case None: ...
-
-    # Capture patterns (bind to name):
-    case x:             # matches anything, binds to x
-        use(x)
-
-    # Wildcard (no binding):
-    case _:             # matches anything, binds nothing
-        pass
-
-    # OR patterns:
-    case 1 | 2 | 3:     # matches any of these values
-        pass
-
-    # Sequence patterns (lists and tuples):
-    case [first, *rest]:          # head/tail destructuring
-        print(first, rest)
-    case (x, y):                  # exactly two elements
-        print(x, y)
-    case []:                      # empty sequence
-        pass
-
-    # Mapping patterns:
-    case {"key": value}:          # dict contains "key"; binds value
-        pass
-    case {"x": int() as x}:       # dict has "x" and it's an int; bind to x
-        pass
-
-    # Class patterns:
-    case Point(x=0, y=0):         # Point instance with x=0, y=0
-        print("origin")
-    case Point(x=x_val, y=y_val): # any Point, binds coordinates
-        print(f"at ({x_val}, {y_val})")
-
-    # As patterns (bind + check):
-    case [x, y] as pair:          # matches 2-element sequence, binds both pair and x,y
-        print(x, y, pair)
-
-    # Guard (if clause):
-    case x if x > 0:              # match only if x > 0
-        pass
+print(handle_event({"type": "click", "button": "left", "x": 10, "y": 20}))
+print(handle_event({"type": "keydown", "key": "Enter"}))
 ```
 
-### Class Patterns and `__match_args__`
-
-Without `__match_args__`, class patterns require keyword syntax:
+### Class Pattern
 
 ```python
 from dataclasses import dataclass
@@ -90,323 +83,325 @@ class Point:
     x: float
     y: float
 
-# Without __match_args__ — keyword args only:
-match p:
-    case Point(x=0, y=0): print("origin")
-    case Point(x=x, y=y): print(f"({x}, {y})")
+@dataclass
+class Circle:
+    center: Point
+    radius: float
 
-# With __match_args__ — positional args allowed:
-class Point:
-    __match_args__ = ('x', 'y')  # defines positional pattern order
+@dataclass
+class Rectangle:
+    top_left: Point
+    bottom_right: Point
 
-    def __init__(self, x, y):
-        self.x = x
-        self.y = y
+def describe_shape(shape) -> str:
+    match shape:
+        case Circle(center=Point(x=0, y=0), radius=r):
+            return f"Circle centered at origin, radius {r}"
+        case Circle(center=Point(x=cx, y=cy), radius=r):
+            return f"Circle at ({cx}, {cy}), radius {r}"
+        case Rectangle(top_left=Point(x=x1, y=y1),
+                       bottom_right=Point(x=x2, y=y2)):
+            w = x2 - x1
+            h = y2 - y1
+            return f"Rectangle {w}x{h} at ({x1},{y1})"
+        case _:
+            return "Unknown shape"
 
-match p:
-    case Point(0, 0): print("origin")          # positional: x=0, y=0
-    case Point(x, y): print(f"({x}, {y})")    # positional bind
+print(describe_shape(Circle(Point(0, 0), 5)))   # Circle centered at origin, radius 5
+print(describe_shape(Circle(Point(1, 2), 3)))   # Circle at (1, 2), radius 3
+
+# Class pattern works with __match_args__:
+print(Point.__match_args__)   # ('x', 'y') — defined by @dataclass
 ```
 
-`@dataclass` automatically sets `__match_args__` to the field names in definition order.
-
-### How match/case Differs from if/elif
+### OR Patterns and Guards
 
 ```python
-# These are CONCEPTUALLY similar but mechanically different:
-
-# if/elif version:
-def process_if(cmd):
-    if isinstance(cmd, list) and len(cmd) >= 2 and cmd[0] == "go":
-        direction = cmd[1]
-        return f"Going {direction}"
-    elif isinstance(cmd, dict) and "action" in cmd:
-        action = cmd["action"]
-        return f"Action: {action}"
-    else:
-        return "Unknown"
-
-# match/case version:
-def process_match(cmd):
-    match cmd:
-        case ["go", direction]:
-            return f"Going {direction}"
-        case {"action": action}:
-            return f"Action: {action}"
+def classify_http_method(method: str) -> str:
+    match method.upper():
+        case "GET" | "HEAD" | "OPTIONS":    # OR pattern
+            return "safe"
+        case "POST" | "PUT" | "PATCH" | "DELETE":
+            return "unsafe"
+        case m if m.startswith("X-"):       # guard
+            return f"extension method: {m}"
         case _:
-            return "Unknown"
+            return "unknown"
+
+# AS pattern — bind after matching:
+def process(value):
+    match value:
+        case [x, y] as point:    # 'point' bound to the whole matched sequence
+            print(f"Point: {point}, x={x}, y={y}")
+
+process([1, 2])   # Point: [1, 2], x=1, y=2
 ```
 
-**Key differences:**
-1. **Sequence matching** — `case [x, y]` checks both structure (2-element) and binds in one step. No separate `isinstance` + `len` check.
-2. **Mapping matching** — mapping patterns check for KEY PRESENCE, not exact match. `case {"action": a}` matches any dict with an "action" key, regardless of other keys.
-3. **No fall-through** — unlike C `switch`, the first matching case executes and control exits. No `break` needed.
-4. **Binding scope** — bindings from patterns are scoped to the `case` block but visible in the surrounding function (variables bound in match cases are available after the match statement).
-
-### Bytecode: It's Not a jump table
+### What `match` Compiles To
 
 ```python
 import dis
 
-def match_demo(x):
+def simple_match(x):
     match x:
-        case 1: return "one"
-        case 2: return "two"
-        case _: return "other"
-
-dis.dis(match_demo)
-```
-
-Output shows `MATCH_SEQUENCE`, `MATCH_MAPPING`, `MATCH_CLASS` opcodes — not a simple comparison chain. For literal integer patterns, the compiler does generate comparison-based code, but for structural patterns, it uses the pattern-matching opcodes. There is no bytecode-level jump table; each pattern is evaluated in order.
-
-### Practical Patterns at Scale
-
-```python
-from dataclasses import dataclass
-from typing import Union
-
-@dataclass
-class AddUser:
-    username: str
-    email: str
-
-@dataclass
-class DeleteUser:
-    user_id: int
-
-@dataclass
-class UpdateEmail:
-    user_id: int
-    new_email: str
-
-Command = Union[AddUser, DeleteUser, UpdateEmail]
-
-def handle_command(cmd: Command) -> str:
-    match cmd:
-        case AddUser(username=name, email=email):
-            return f"Adding {name} ({email})"
-        case DeleteUser(user_id=uid):
-            return f"Deleting user {uid}"
-        case UpdateEmail(user_id=uid, new_email=email):
-            return f"Updating {uid}'s email to {email}"
+        case 1:
+            return "one"
+        case 2:
+            return "two"
         case _:
-            raise ValueError(f"Unknown command: {cmd!r}")
+            return "other"
 
-# Works with exhaustiveness checking in type checkers (pyright, mypy)
-```
+dis.dis(simple_match)
+# match/case compiles to:
+# COPY (or LOAD_FAST) x
+# For literal patterns: COMPARE_OP + POP_JUMP_IF_FALSE to next case
+# For capture patterns: STORE_FAST (always succeeds)
+# For class patterns: GET_LEN, MATCH_CLASS, etc.
 
-### `__match_args__` in Custom Classes
-
-```python
-class Token:
-    __match_args__ = ('type', 'value')
-
-    def __init__(self, type: str, value: str):
-        self.type = type
-        self.value = value
-
-def parse_token(token: Token):
-    match token:
-        case Token("NUMBER", value):             # positional: type="NUMBER"
-            return int(value)
-        case Token("STRING", value):
-            return value.strip('"')
-        case Token("IDENT", "if"):               # specific keyword
-            return "if_keyword"
-        case Token("IDENT", name):               # any identifier
-            return f"identifier:{name}"
-        case Token(tok_type, _):                 # catch-all with type bound
-            raise SyntaxError(f"Unexpected {tok_type}")
+# It is NOT a jump table (unlike C switch) — it's sequential if-elif checks
+# For literals: O(n) — test each case in order until one matches
+# For class patterns: uses __match_args__ and attribute access
 ```
 
 ---
 
 ## Interview Questions
 
-### Q1: How does structural pattern matching differ from a series of `isinstance` checks?
+### Q1: How does class pattern matching work and what is `__match_args__`?
 
-**Model answer:**  
-`match`/`case` goes beyond `isinstance` in three ways:
-
-1. **Simultaneous structure and content checking:**
-```python
-# isinstance approach — multiple checks:
-if isinstance(data, list) and len(data) == 2:
-    first, second = data
-    if isinstance(first, str):
-        process(first, second)
-
-# match approach — one pattern:
-match data:
-    case [str() as first, second]:  # checks: is list, has 2 elements, first is str
-        process(first, second)
-```
-
-2. **Mapping partial matching:** `case {"key": val}` matches any dict that HAS "key", not only dicts with exactly one key. `isinstance` + key check requires two operations.
-
-3. **Binding in patterns:** Variables bound in patterns are usable immediately without separate assignment. `case Point(x=x_coord)` both checks and binds in one expression.
-
-The compiler transforms `match`/`case` into efficient bytecode using dedicated opcodes (`MATCH_SEQUENCE`, `MATCH_MAPPING`, `MATCH_CLASS`). For structural patterns, this is clearer AND faster than equivalent `isinstance` chains because it reduces attribute lookups and intermediate boolean checks.
-
-### Q2: What is `__match_args__` and what happens without it?
-
-**Model answer:**  
-`__match_args__` is a class-level tuple that maps positional pattern arguments to attribute names. When a class pattern uses positional syntax (`case MyClass(a, b)`), Python uses `__match_args__` to convert positions to keyword lookups:
+**Model answer:**
+When a class pattern is used, Python:
+1. Calls `isinstance(subject, ClassName)` — if False, pattern doesn't match.
+2. Uses `__match_args__` (a class attribute, auto-generated by `@dataclass`) to map positional pattern arguments to attribute names.
+3. For each keyword argument in the pattern, accesses `getattr(subject, name)` and matches it recursively.
 
 ```python
-class Point:
-    __match_args__ = ('x', 'y')
-    def __init__(self, x, y):
-        self.x = x
-        self.y = y
+class Vector:
+    __match_args__ = ('x', 'y', 'z')   # positional pattern order
 
-p = Point(3, 4)
+    def __init__(self, x, y, z):
+        self.x, self.y, self.z = x, y, z
 
-match p:
-    case Point(3, y):  # positional: checks p.x == 3, binds p.y to y
-        print(y)       # 4
-```
+v = Vector(1, 2, 3)
 
-Without `__match_args__`, positional syntax raises `TypeError`. Only keyword patterns work:
-```python
+match v:
+    case Vector(x, y, z):   # positional — maps to x=1, y=2, z=3 via __match_args__
+        print(f"Vector: {x}, {y}, {z}")
+
+    case Vector(x=1, y=y_val):  # keyword — accesses v.x and v.y
+        print(f"x=1, y={y_val}")
+
+# Without __match_args__, only keyword patterns work:
 class NoMatchArgs:
-    def __init__(self, x, y):
-        self.x = x
-        self.y = y
+    def __init__(self, val):
+        self.val = val
 
-n = NoMatchArgs(3, 4)
-match n:
-    case NoMatchArgs(3, y):      # TypeError: NoMatchArgs() accepts no positional patterns
-        pass
-    case NoMatchArgs(x=3, y=y):  # keyword syntax always works
-        print(y)
+    # No __match_args__
+
+match NoMatchArgs(5):
+    case NoMatchArgs(val=v):   # OK — keyword pattern
+        print(v)
+    # case NoMatchArgs(v):     # TypeError — __match_args__ not defined
 ```
 
-`@dataclass` automatically sets `__match_args__ = tuple(field.name for field in fields)`. Named tuples also set it automatically.
+### Q2: What are the performance characteristics of `match`/`case` vs `if`/`elif`?
 
-### Q3: Can `match`/`case` be used with arbitrary objects? What protocol does it use?
-
-**Model answer:**  
-Class patterns use attribute access, not a special protocol (unlike `__iter__` for sequence patterns). For `case MyClass(x=val)`, Python:
-1. Checks `isinstance(subject, MyClass)`.
-2. Accesses `subject.x` and checks if it matches `val` (or binds to `val` if it's a capture).
-
-For sequence patterns, the subject must NOT be an instance of `str`, `bytes`, or `bytearray` (to avoid treating strings as character sequences unexpectedly). The check is `isinstance(subject, collections.abc.Sequence)` implicitly.
-
-For mapping patterns, the subject must support `__getitem__` and `keys()` (dict-like). `MATCH_MAPPING` opcode checks `isinstance(subject, collections.abc.Mapping)`.
-
-```python
-from collections.abc import Mapping, Sequence
-
-class CustomMapping(Mapping):
-    def __init__(self, data):
-        self._data = data
-    def __getitem__(self, key): return self._data[key]
-    def __iter__(self): return iter(self._data)
-    def __len__(self): return len(self._data)
-
-cm = CustomMapping({"action": "run"})
-match cm:
-    case {"action": a}:  # works — CustomMapping IS a Mapping
-        print(a)         # "run"
-```
-
-### Q4: How does the bytecode compiler handle a large `match` statement vs. a chain of `if/elif`?
-
-**Model answer:**  
-For a `match` statement, the compiler generates:
-1. A `MATCH_SEQUENCE` / `MATCH_MAPPING` / `MATCH_CLASS` opcode that checks the pattern type.
-2. `GET_LEN` + comparisons for fixed-length checks.
-3. `STORE_FAST` for bindings.
-4. `JUMP_FORWARD` on mismatch to the next case.
-
-This is NOT a jump table. Each case is checked in order — worst case O(n cases). The compiler does not generate a hash-based dispatch for literal patterns (unlike some languages).
-
-For pure literal matching (integers, strings), `if/elif` with `==` and `match`/`case` compile to very similar bytecode — `match` may have slight overhead from the structural check machinery.
+**Model answer:**
+`match`/`case` compiles to essentially the same bytecode as `if`/`elif` chains. There is no jump table optimization for literal patterns — it's O(n) sequential matching.
 
 ```python
 import dis
 
-# match with literals:
-def m(x):
+# These compile to nearly identical bytecode:
+def with_match(x):
     match x:
-        case 1: return "one"
-        case 2: return "two"
+        case 1: return "a"
+        case 2: return "b"
+        case _: return "c"
 
-# if/elif with literals:
-def f(x):
-    if x == 1: return "one"
-    elif x == 2: return "two"
+def with_elif(x):
+    if x == 1: return "a"
+    elif x == 2: return "b"
+    else: return "c"
 
-# Bytecode is nearly identical for the literal case
-# match has slight overhead: MATCH_SEQUENCE check, etc.
-# For large integer dispatches, a dict is faster than either
+# For performance-critical code with many integer cases, use a dispatch dict:
+DISPATCH = {1: "a", 2: "b"}
+def dict_dispatch(x):
+    return DISPATCH.get(x, "c")   # O(1) dict lookup
+
+# match/case advantages:
+# 1. More readable for complex structural patterns
+# 2. Type-safe destructuring (extracts values without manual indexing)
+# 3. Exhaustiveness checking (mypy/pyright can warn on unhandled cases with Never)
+# 4. No accidental variable shadowing in nested conditions
 ```
 
-### Q5: What is an "irrefutable pattern" and why does Python restrict where it can appear?
+### Q3: What is the difference between a "capture pattern" and a "value pattern" in match/case?
 
-**Model answer:**  
-An irrefutable pattern is one that always succeeds — it can never fail to match. Irrefutable patterns include:
-- Wildcard `_`
-- Capture patterns (bare names like `x`)
-- OR patterns where all alternatives are irrefutable
-
-Python requires that only the LAST case in a `match` statement can be irrefutable:
+**Model answer:**
+This is a crucial gotcha. A bare name in a `case` is ALWAYS a capture (binds the value). To match against a constant stored in a variable, you must use a dotted name:
 
 ```python
-match x:
-    case _:             # irrefutable — always matches
-        pass            # must be last; otherwise subsequent cases are unreachable
-    case 1:             # SyntaxError: this would never be reached
-        pass
+# WRONG: case x doesn't match the value of x — it captures!
+target = 42
+
+match value:
+    case target:   # This CAPTURES value into target, doesn't compare!
+        print("matched")  # Always runs (capture always succeeds)
+
+# CORRECT: use dotted name to reference a constant
+class Status:
+    OK = 200
+    NOT_FOUND = 404
+
+match code:
+    case Status.OK:         # value pattern — compares code == Status.OK
+        print("OK")
+    case Status.NOT_FOUND:  # value pattern — dotted name lookup
+        print("Not found")
+
+# Also correct: use literal values (not variables) for literal patterns
+THRESHOLD = 100  # module-level constant
+match n:
+    case n if n == THRESHOLD:  # guard with explicit comparison
+        ...
+    # case THRESHOLD:  # WRONG — would capture into THRESHOLD, shadowing it!
 ```
 
-This prevents unreachable code (analogous to `default:` in C `switch` — must come last). Capture patterns in specific positions are NOT irrefutable because they're part of a larger structural pattern:
+This is the most common `match`/`case` bug: `case some_var` doesn't compare against `some_var` — it captures the matched value into `some_var`.
+
+### Q4: How do you use `match`/`case` for exhaustive ADT-style pattern matching?
+
+**Model answer:**
+Use sealed class hierarchies (all subclasses known) and type checkers for exhaustiveness:
 
 ```python
-match point:
-    case Point(x=0, y=y):  # x=0 is refutable; y=y is irrefutable WITHIN the pattern
-        # but the case as a whole is refutable (point.x might not be 0)
-        pass
-    case _:               # correctly placed last
-        pass
+from dataclasses import dataclass
+from typing import Never
+
+@dataclass
+class Ok:
+    value: int
+
+@dataclass
+class Err:
+    message: str
+
+type Result = Ok | Err   # Python 3.12 type alias
+
+def process(result: Result) -> str:
+    match result:
+        case Ok(value=v):
+            return f"Success: {v}"
+        case Err(message=msg):
+            return f"Error: {msg}"
+        # mypy/pyright will warn if any subtype of Result is unhandled
+
+# Exhaustiveness check via Never:
+def assert_never(value: Never) -> Never:
+    raise AssertionError(f"Unexpected value: {value!r}")
+
+def process_exhaustive(result: Result) -> str:
+    match result:
+        case Ok(value=v):
+            return f"Success: {v}"
+        case Err(message=msg):
+            return f"Error: {msg}"
+        case _ as unreachable:
+            assert_never(unreachable)   # type error if Result gains a new variant
+
+# Practical example: AST processing
+@dataclass
+class Literal:
+    value: int
+
+@dataclass
+class Add:
+    left: 'Expr'
+    right: 'Expr'
+
+@dataclass
+class Mul:
+    left: 'Expr'
+    right: 'Expr'
+
+type Expr = Literal | Add | Mul
+
+def evaluate(expr: Expr) -> int:
+    match expr:
+        case Literal(value=v):
+            return v
+        case Add(left=l, right=r):
+            return evaluate(l) + evaluate(r)
+        case Mul(left=l, right=r):
+            return evaluate(l) * evaluate(r)
+
+result = evaluate(Add(Mul(Literal(2), Literal(3)), Literal(4)))
+print(result)   # 10
 ```
 
-The irrefutability check is done at compile time by the AST-to-bytecode compiler (in `Python/compile.c`), which raises `SyntaxError` for unreachable cases.
+### Q5: How does pattern matching handle custom classes that don't use `@dataclass`?
+
+**Model answer:**
+Any class can participate in structural pattern matching by defining `__match_args__` and ensuring the matched attributes are accessible:
+
+```python
+class HTTPRequest:
+    __match_args__ = ('method', 'path', 'headers')
+
+    def __init__(self, method: str, path: str, headers: dict):
+        self.method = method
+        self.path = path
+        self.headers = headers
+
+    # Optional: custom matching via __match_class__
+    # (Not a standard dunder — class patterns use isinstance + attribute access)
+
+def route(request: HTTPRequest) -> str:
+    match request:
+        case HTTPRequest('GET', '/', _):
+            return "home page"
+        case HTTPRequest('POST', '/api/users', headers) if 'Authorization' in headers:
+            return "create user (authenticated)"
+        case HTTPRequest(method, path, _):
+            return f"{method} {path} — unhandled"
+
+req = HTTPRequest('GET', '/', {})
+print(route(req))   # home page
+
+# For built-in types: use their natural patterns
+# str: matches as a string literal or captures as variable
+# int, float: matches as numeric literal or capture
+# list, tuple: use sequence patterns
+# dict: use mapping patterns
+
+# Note: bool is a subclass of int, so:
+match True:
+    case True:   # literal pattern matches
+        print("true")
+    # case 1: would ALSO match True! (True == 1)
+    # Match is structural — types matter: use 'case bool() if value:' for type-safe bool check
+```
 
 ---
 
 ## Gotcha Follow-ups
 
-**"Does `match` support fall-through like C's `switch`?"**  
-No. Python's `match` exits after the first matching case. There is no `break` keyword needed. To handle multiple patterns with the same code, use OR patterns (`case 1 | 2 | 3`) or a single pattern with a guard (`case x if x in {1, 2, 3}`). Fall-through is deliberately excluded from the design (PEP 634).
+**"Does `match`/`case` short-circuit or evaluate all patterns?"**
+It evaluates patterns in order and stops at the first match (`case` is like `elif`). Patterns are NOT evaluated if a previous case already matched. However, the guard expression (`if condition`) is evaluated for each case even after the pattern matches — if the guard is False, matching continues to the next case.
 
-**"Does pattern matching work on `None`? What's the difference between `case None:` and `case x:` when the value is `None`?"**  
-`case None:` is a literal pattern — it only matches `None`. `case x:` is a capture pattern — it matches anything, including `None`, and binds it to `x`. This distinction matters:
-
-```python
-match value:
-    case None:       # only matches None; uses IS check internally
-        pass
-    case x:          # matches anything including None; binds to x
-        use(x)
-```
-
-Internally, `case None:` uses an IS comparison (`value is None`), not `==`. This is efficient and correct for `None`, `True`, and `False` (which are singletons). Literal patterns for these three use identity comparison; numeric literals use `==`.
+**"Can you fall through between cases like in C switch?"**
+No — there is no fall-through. Each `case` block is independent. This is intentional: fall-through in C switch is a notorious source of bugs. If you need the same action for multiple patterns, use OR patterns: `case 1 | 2 | 3: return "small"`.
 
 ---
 
 ## Under the Hood
 
-Pattern matching is implemented across several files:
-- `Python/compile.c` — compiles match statements to bytecode
-- `Python/ceval.c` — implements `MATCH_SEQUENCE`, `MATCH_MAPPING`, `MATCH_CLASS` opcodes
-- `Objects/matchobject.c` — the match object that accumulates pattern bindings
+`match`/`case` is compiled in `Python/compile.c: compiler_match()` and `compiler_pattern_*()` functions. Each pattern type has a dedicated compiler function:
+- Literal: `COMPARE_OP` (== comparison) or `IS_OP` (for None/True/False)
+- Capture: `STORE_FAST` (always succeeds)
+- Sequence: `GET_LEN` + `MATCH_SEQUENCE` + `UNPACK_SEQUENCE`
+- Mapping: `MATCH_MAPPING` + `MATCH_KEYS`
+- Class: `MATCH_CLASS` (calls `isinstance()` + extracts `__match_args__` attributes)
 
-`MATCH_CLASS` opcode:
-1. Checks `isinstance(subject, cls)`.
-2. If the class has `__match_args__`, resolves positional patterns to attribute names.
-3. For each attribute pattern, reads `getattr(subject, attr_name)` and checks/binds.
-4. Returns a tuple of positional attribute values (or None on failure) for the compiler to unpack.
-
-The match statement does NOT implement exhaustiveness checking at runtime — that's left to static type checkers (mypy 0.930+, pyright). At runtime, if no case matches and there's no `case _:`, the match statement simply falls through with no error.
+`MATCH_CLASS` opcode (`Python/ceval.c`): calls `match_class()` which: (1) `isinstance(subject, cls)`, (2) resolves positional patterns via `__match_args__`, (3) calls `getattr(subject, attr)` for each named pattern, (4) stores extracted values for subsequent `STORE_FAST` opcodes. There is no fallthrough and no computed goto optimization — each `case` block ends with a `JUMP_FORWARD` to skip remaining cases.

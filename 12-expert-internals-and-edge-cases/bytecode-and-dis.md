@@ -2,312 +2,349 @@
 
 ## Concept
 
-Python source is compiled to bytecode — a platform-independent instruction set executed by the CPython virtual machine (the "eval loop" in `Python/ceval.c`). Understanding bytecode is essential for: performance analysis, understanding optimization opportunities, debugging obscure behavior, and writing tools (profilers, coverage analyzers, debuggers).
+CPython compiles Python source to bytecode — a sequence of instructions executed by the CPython virtual machine (ceval.c). Understanding bytecode is essential for explaining performance characteristics, debugging subtle bugs, and understanding optimizations like the specializing adaptive interpreter.
 
-### Reading dis.dis() Output
+### Reading `dis` Output
 
 ```python
 import dis
 
-def add_numbers(a, b):
+def add_and_return(a, b):
     result = a + b
     return result
 
-dis.dis(add_numbers)
+dis.dis(add_and_return)
 ```
 
 Output (Python 3.12):
 ```
-  2           RESUME          0
+  2           RESUME           0
 
-  3           LOAD_FAST       0 (a)
-              LOAD_FAST       1 (b)
-              BINARY_OP       0 (+)
-              STORE_FAST      2 (result)
+  3           LOAD_FAST        0 (a)
+              LOAD_FAST        1 (b)
+              BINARY_OP        0 (+)
+              STORE_FAST       2 (result)
 
-  4           LOAD_FAST       2 (result)
+  4           LOAD_FAST        2 (result)
               RETURN_VALUE
 ```
 
-**Column meanings:**
-1. Source line number
-2. Instruction offset (bytes)
-3. Opcode name
-4. Argument (integer)
-5. Argument human-readable (in parentheses)
+Column meanings:
+- Line number (source)
+- Bytecode offset (in bytes in the `.pyc` file)
+- Opcode name
+- Opcode argument (integer index)
+- Human-readable argument (in parentheses)
 
-### Key Opcodes
-
-| Opcode | What It Does |
-|--------|-------------|
-| `LOAD_FAST n` | Push local variable `n` onto stack |
-| `STORE_FAST n` | Pop stack top → local `n` |
-| `LOAD_GLOBAL n` | Push global/builtin (3.12: includes NULL check) |
-| `LOAD_CONST n` | Push constant from `co_consts[n]` |
-| `BINARY_OP n` | Pop two operands, perform operation `n`, push result |
-| `CALL n` | Call callable with `n` args from stack |
-| `RETURN_VALUE` | Return top of stack to caller |
-| `JUMP_BACKWARD n` | Jump back (loops) — also triggers `eval_breaker` check |
-| `GET_ITER` | Call `iter()` on top of stack |
-| `FOR_ITER n` | Call `next()` on iterator; jump by `n` on `StopIteration` |
-| `BUILD_LIST n` | Build list from top `n` stack items |
-| `RESUME n` | Entry point marker for coroutines and functions (3.11+) |
-| `CACHE` | Inline cache slot for specializing adaptive interpreter (3.11+) |
-
-### Inspecting Code Objects
+### Code Objects
 
 ```python
-def example(x, y=10):
-    z = x + y
-    return z
+code = add_and_return.__code__
 
-code = example.__code__
-print(code.co_varnames)    # ('x', 'y', 'z') — local variable names
-print(code.co_consts)      # (None, 10) — constants
-print(code.co_names)       # () — global/attr names used
-print(code.co_filename)    # '<stdin>'
+print(code.co_varnames)    # ('a', 'b', 'result') — local variable names
+print(code.co_consts)      # (None,) — constants used
+print(code.co_name)        # 'add_and_return'
+print(code.co_argcount)    # 2
+print(code.co_filename)    # '<stdin>' or actual path
 print(code.co_firstlineno) # 1
-print(code.co_argcount)    # 1 (positional args; defaults separate)
-print(code.co_stacksize)   # max stack depth needed (for safety validation)
-print(code.co_flags)       # bitmask: CO_OPTIMIZED, CO_NEWLOCALS, CO_VARARGS, etc.
+print(code.co_stacksize)   # 2 (max stack depth needed)
+print(code.co_code)        # raw bytes of bytecode (Python 3.11: co_code is deprecated, use co_code)
+print(code.co_flags)       # bitmask: CO_NESTED, CO_GENERATOR, CO_COROUTINE, etc.
 
-# Raw bytecode as bytes:
-print(code.co_code)        # b'\x97\x00|\x00|\x01\x17\x00}\x02|\x02S\x00'
+# co_code is a bytes object; in Python 3.12 use code.co_code or dis.get_instructions():
+for instr in dis.get_instructions(add_and_return):
+    print(f"{instr.offset:3d} {instr.opname:<25} {instr.argval!r}")
 ```
 
-### CACHE Opcodes (3.11+ Specializing Interpreter)
-
-In Python 3.11+, several opcodes are followed by `CACHE` entries that the specializing adaptive interpreter uses to store inline caches:
-
-```python
-def typed_add(x: int, y: int):
-    return x + y
-
-dis.dis(typed_add)
-# BINARY_OP followed by CACHE entries that the adaptive interpreter
-# will replace with BINARY_OP_ADD_INT after seeing int+int twice
-```
-
-These `CACHE` entries are not real instructions — they're memory slots for the specializer. Don't be alarmed when they appear in disassembly.
-
-### Disassembling Different Object Types
+### Inspecting More Complex Bytecode
 
 ```python
 import dis
 
-# Functions:
-dis.dis(some_function)
+def comprehension_demo(n):
+    return [x * x for x in range(n) if x % 2 == 0]
 
-# Classes (dis all methods):
-dis.dis(SomeClass)
+dis.dis(comprehension_demo)
+# Note: the comprehension compiles to a NESTED code object
+# dis.dis() recursively disassembles nested code objects
 
-# Generators:
+# Disassemble the comprehension's code object separately:
+code = comprehension_demo.__code__
+for const in code.co_consts:
+    if hasattr(const, 'co_code'):
+        print("Nested code object:")
+        dis.dis(const)
+```
+
+### Peephole Optimizer — Constant Folding
+
+```python
+import dis
+
+# CPython folds constants at compile time:
+def folded():
+    return 2 + 2   # never sees BINARY_OP at runtime
+
+dis.dis(folded)
+# LOAD_CONST   4   ← 2+2 computed at compile time, not runtime!
+# RETURN_VALUE
+
+def also_folded():
+    return "hello" + " " + "world"
+# LOAD_CONST   'hello world'  ← joined at compile time
+
+def not_folded(x):
+    return x + 2   # x is a variable — can't fold
+# LOAD_FAST   0 (x)
+# LOAD_CONST  2
+# BINARY_OP   0 (+)  ← must compute at runtime
+```
+
+### Bytecode for Exception Handling
+
+```python
+import dis
+
+def with_try(x):
+    try:
+        return 1 / x
+    except ZeroDivisionError:
+        return 0
+
+dis.dis(with_try)
+# Python 3.11+: uses PUSH_EXC_INFO, POP_EXCEPT for exception table
+# Python 3.12: uses a separate exception table (co_exceptiontable)
+
+# Exception table is now separate from bytecode for better performance:
+code = with_try.__code__
+print(dis.findlinestarts(code))   # map offset → line number
+
+# Python 3.12: exception table entries:
+for entry in code.co_exceptiontable:
+    pass   # PEP 664 — exception table for 3.11+
+```
+
+### Generator and Coroutine Bytecode
+
+```python
+import dis
+
 def gen():
-    yield from range(10)
+    yield 1
+    yield 2
+
 dis.dis(gen)
+# RESUME           0
+# LOAD_CONST       1 (1)
+# YIELD_VALUE           ← pauses execution, returns value to caller
+# RESUME           1   ← resumes here on next()
+# LOAD_CONST       2 (2)
+# YIELD_VALUE
+# LOAD_CONST       None
+# RETURN_VALUE
 
-# Lambda:
-f = lambda x: x * 2
-dis.dis(f)
+async def coro():
+    await some_awaitable()
 
-# String of code:
-dis.dis("x = 1 + 2")
-
-# Bytecode object directly:
-code = compile("x = 1 + 2", "<string>", "exec")
-dis.dis(code)
+dis.dis(coro)
+# RESUME           0
+# LOAD_GLOBAL      ... (some_awaitable)
+# CALL             0
+# GET_AWAITABLE    0
+# LOAD_CONST       None
+# SEND             ...   ← drives the awaitable
+# YIELD_VALUE           ← suspends coroutine
+# RESUME           3
+# POP_TOP
+# RETURN_VALUE
 ```
-
-### Real Example: Why `x += 1` is Not Atomic
-
-```python
-import dis
-
-def increment():
-    global counter
-    counter += 1
-
-dis.dis(increment)
-```
-```
-LOAD_GLOBAL    counter     # read counter
-LOAD_CONST     1           # push 1
-BINARY_OP      +=          # add
-STORE_GLOBAL   counter     # write back
-```
-
-Four opcodes. The GIL can switch after each one. Two threads can both execute `LOAD_GLOBAL counter` and read the same value. This is why `counter += 1` is not thread-safe.
 
 ---
 
 ## Interview Questions
 
-### Q1: How do you use `dis` to diagnose a performance issue in a Python function?
+### Q1: What is CPython bytecode and how does it relate to the source code?
 
-**Model answer:**  
-Look for expensive opcodes that appear in loops, or operations that trigger type-checking overhead:
+**Model answer:**
+CPython bytecode is a platform-independent intermediate representation produced by the Python compiler (`Python/compile.c`) from the AST. It's a sequence of 2-byte (Python 3.6+) or 1-word (Python 3.12+, "wordcode") instructions — an opcode byte/word followed by an argument — executed by the CPython evaluation loop (`Python/ceval.c: _PyEval_EvalFrameDefault()`).
 
-```python
-import dis
-
-def slow_concat(words):
-    result = ""
-    for word in words:
-        result = result + word  # string concatenation in loop
-    return result
-
-dis.dis(slow_concat)
-# BINARY_OP + appears in the loop body — O(n²) string concatenation
-# Each iteration creates a new string, copying all previous characters
-```
-
-What to look for:
-1. **`LOAD_GLOBAL` in a tight loop** — global lookups are slower than local. Assign to a local variable outside the loop: `join_fn = "".join`.
-2. **`LOAD_ATTR` on hot path** — each attribute access goes through the descriptor protocol. Cache frequently-used attributes: `append = mylist.append`.
-3. **`CALL` with many arguments** — function calls have overhead. Consider inlining for hot paths.
-4. **Type-check opcodes** — `ISINSTANCE`, `CONTAINS_OP` may trigger slow paths on non-optimized types.
-
-### Q2: What is `co_flags` and what do the flag bits mean?
-
-**Model answer:**  
-`co_flags` is a bitmask on the code object that describes properties of the function:
+The pipeline: `.py` source → tokenizer → parser → AST → `compile()` → `code` object (bytecode + metadata) → `.pyc` cached file → executed by the VM.
 
 ```python
-import inspect
+import ast, dis, compile
 
-def example(*args, **kwargs):
-    x = 1
-    return x
+source = "x = 1 + 2"
 
-code = example.__code__
-flags = code.co_flags
+# Step 1: AST
+tree = ast.parse(source)
+print(ast.dump(tree, indent=2))
 
-print(bool(flags & inspect.CO_OPTIMIZED))   # True — uses LOAD_FAST/STORE_FAST
-print(bool(flags & inspect.CO_NEWLOCALS))   # True — has its own local namespace
-print(bool(flags & inspect.CO_VARARGS))     # True — has *args
-print(bool(flags & inspect.CO_VARKEYWORDS)) # True — has **kwargs
+# Step 2: compile
+code = compile(source, "<string>", "exec")
 
-# Coroutine flags:
-async def coro(): pass
-print(bool(coro.__code__.co_flags & inspect.CO_COROUTINE))  # True
-
-def gen():
-    yield
-print(bool(gen.__code__.co_flags & inspect.CO_GENERATOR))  # True
-```
-
-`CO_OPTIMIZED` means locals are accessed via `LOAD_FAST`/`STORE_FAST` (index-based, O(1)) rather than `LOAD_NAME`/`STORE_NAME` (dict lookup). All functions with no `exec()` or unqualified `import *` get this flag. This is why inner functions are faster for locals than global scope.
-
-### Q3: What's the difference between `LOAD_FAST` and `LOAD_GLOBAL`, and why does it matter for performance?
-
-**Model answer:**  
-
-- **`LOAD_FAST n`** — accesses `frame->localsplus[n]` directly by integer index. O(1), single pointer dereference, no dict lookup.
-- **`LOAD_GLOBAL name`** — looks up `name` in the function's `__globals__` dict, then the builtins dict if not found. Two dict lookups in the worst case; optimized to one via the inline cache in Python 3.11+.
-
-Practically, `LOAD_FAST` is 2-3x faster than `LOAD_GLOBAL`. In tight inner loops:
-
-```python
-import time
-
-data = list(range(1_000_000))
-
-# Slow — LOAD_GLOBAL for 'len' every iteration:
-def count_slow(lst):
-    count = 0
-    for item in lst:
-        if len(item) > 0:  # LOAD_GLOBAL 'len' each time
-            count += 1
-    return count
-
-# Fast — cache global as local:
-def count_fast(lst):
-    count = 0
-    _len = len   # local reference — LOAD_FAST
-    for item in lst:
-        if _len(item) > 0:
-            count += 1
-    return count
-```
-
-This optimization was more important before Python 3.11's specializing interpreter, which caches global lookups. Still relevant in 3.10 and older.
-
-### Q4: How do you disassemble a compiled .pyc file?
-
-**Model answer:**  
-```python
-import dis
-import marshal
-import struct
-
-def disassemble_pyc(path):
-    with open(path, 'rb') as f:
-        # .pyc header: magic number (4 bytes) + bit flags (4) + timestamps/hash (8+)
-        # Python 3.8+: 16-byte header
-        f.read(16)
-        code = marshal.load(f)
-
-    dis.dis(code)
-
-# Or more simply:
-import py_compile
-import importlib.util
-
-# Compile a .py to .pyc:
-py_compile.compile('myfile.py', 'myfile.pyc')
-
-# Then load and disassemble:
-spec = importlib.util.spec_from_file_location("module", "myfile.py")
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-
-# Directly from source via compile():
-with open('myfile.py') as f:
-    source = f.read()
-code = compile(source, 'myfile.py', 'exec')
+# Step 3: bytecode
 dis.dis(code)
+# LOAD_CONST   3 (1+2 folded)
+# STORE_NAME   0 (x)
+# LOAD_CONST   None
+# RETURN_VALUE
 ```
 
-Practical use: examining what a decorator or class body compiles to without running it.
+Bytecode is NOT machine code — it's still interpreted. CPython walks the instruction list in a `for` loop (or switch statement). PyPy, by contrast, JIT-compiles hot bytecode to native machine code.
 
-### Q5: What does `RESUME 0` at the top of every function mean in Python 3.11+?
+### Q2: What information is in a `code` object and how do you access it?
 
-**Model answer:**  
-`RESUME` was added in Python 3.11 to serve as a unified entry point marker for:
-1. Regular function calls (argument `0`).
-2. Generator `.send()` or `.__next__()` resumes.
-3. Coroutine resumes after `await`.
+**Model answer:**
+A `code` object (`PyCodeObject`) contains everything the VM needs to execute a function:
 
-Before 3.11, the eval loop had implicit entry point logic scattered throughout. `RESUME` makes entry points explicit and allows:
-- Tracing tools (`sys.settrace`) to correctly identify call vs. resume events.
-- The specializing adaptive interpreter to reset specialization state on entry.
-- Better frame introspection tooling.
+| Attribute | Type | Contents |
+|-----------|------|----------|
+| `co_code` | bytes | Raw bytecode (deprecated 3.12, use `co_code`) |
+| `co_consts` | tuple | Constants: None, literals, nested code objects |
+| `co_varnames` | tuple | Local variable names (indexed by LOAD_FAST arg) |
+| `co_names` | tuple | Global/attribute names (indexed by LOAD_GLOBAL/LOAD_ATTR) |
+| `co_freevars` | tuple | Names closed over from enclosing scope |
+| `co_cellvars` | tuple | Names closed over by nested functions |
+| `co_argcount` | int | Number of positional parameters |
+| `co_stacksize` | int | Maximum stack depth (pre-computed by compiler) |
+| `co_flags` | int | Bitmask: CO_GENERATOR, CO_COROUTINE, CO_OPTIMIZED, etc. |
+| `co_filename` | str | Source file path |
+| `co_firstlineno` | int | First source line number |
 
-The argument to `RESUME` indicates the type of resume:
-- `0` — regular function call
-- `1` — generator `.__next__()`
-- `2` — generator `.send(value)` (or coroutine resume via `await`)
-- `3` — generator `.throw(exception)` resume
+```python
+def outer():
+    x = 1
+    def inner():
+        return x    # x is in co_freevars
+    return inner
+
+print(outer.__code__.co_cellvars)   # ('x',) — closed over by inner
+print(outer().__code__.co_freevars) # ('x',) — captured from outer
+```
+
+### Q3: How does CPython's peephole optimizer work and what does it optimize?
+
+**Model answer:**
+The peephole optimizer (`Python/flowgraph.c` in Python 3.12, formerly `Python/peephole.c`) runs after compilation to eliminate obviously redundant instructions:
+
+1. **Constant folding:** `1 + 2` → `LOAD_CONST 3`. Applies to arithmetic, string concatenation, tuple construction from constants.
+2. **Constant tuple construction:** `(1, 2, 3)` → single `LOAD_CONST (1, 2, 3)` instead of 3 loads + `BUILD_TUPLE`.
+3. **Dead code elimination:** code after `return` or `raise` at the top level of a block.
+4. **Jump optimization:** chains of unconditional jumps collapsed to single jump.
+5. **`None`/`True`/`False` constant folding:** `if True:` blocks have the condition removed.
+
+```python
+import dis
+
+def folded_tuple():
+    return (1, 2, 3)   # not 3 pushes + BUILD_TUPLE
+
+dis.dis(folded_tuple)
+# LOAD_CONST   (1, 2, 3)  ← single constant!
+# RETURN_VALUE
+
+def no_fold(x):
+    return (x, 2, 3)   # x is a variable — can't fold
+
+dis.dis(no_fold)
+# LOAD_FAST    0 (x)
+# LOAD_CONST   2
+# LOAD_CONST   3
+# BUILD_TUPLE  3
+# RETURN_VALUE
+```
+
+Notably, the peephole optimizer does NOT optimize: list/dict/set literals with constants (these are always constructed at runtime), function calls, or attribute access.
+
+### Q4: What's the difference between `dis.dis()`, `dis.code_info()`, and `dis.get_instructions()`?
+
+**Model answer:**
+- `dis.dis(obj)`: pretty-print disassembly, recursively descends into nested code objects (comprehensions, lambdas, nested functions). Best for human reading.
+- `dis.code_info(obj)`: summary of the code object's attributes (name, filename, argcount, varnames, etc.) without the bytecode itself.
+- `dis.get_instructions(obj)`: returns an iterator of `Instruction` named tuples — machine-readable. Use this for programmatic analysis.
+
+```python
+import dis
+
+def square(x):
+    return x * x
+
+# dis.dis: human-readable
+dis.dis(square)
+
+# dis.code_info: metadata
+print(dis.code_info(square))
+
+# dis.get_instructions: programmatic
+for instr in dis.get_instructions(square):
+    print(f"offset={instr.offset} op={instr.opname} arg={instr.argrepr}")
+    # offset=2 op=LOAD_FAST arg='x'
+    # offset=4 op=LOAD_FAST arg='x'
+    # offset=6 op=BINARY_OP arg='*'
+    # offset=10 op=RETURN_VALUE arg=''
+
+# Count opcodes:
+from collections import Counter
+op_counts = Counter(
+    instr.opname for instr in dis.get_instructions(square)
+)
+print(op_counts)  # Counter({'LOAD_FAST': 2, 'BINARY_OP': 1, 'RETURN_VALUE': 1, ...})
+```
+
+### Q5: How can you modify bytecode at runtime and what are the risks?
+
+**Model answer:**
+Code objects are immutable in Python — you can't modify them in-place. But you can create a new code object with modified bytecode using `types.CodeType` or the `bytecode` library:
+
+```python
+import dis, types
+
+def original(x):
+    return x + 1
+
+# Create a modified version that returns x + 2:
+code = original.__code__
+
+# Replace constant 1 with 2 (change co_consts):
+new_consts = tuple(2 if c == 1 else c for c in code.co_consts)
+
+# Python 3.8+: code.replace() (immutable, returns new code object)
+new_code = code.replace(co_consts=new_consts)
+new_fn = types.FunctionType(new_code, original.__globals__)
+
+print(original(10))   # 11
+print(new_fn(10))     # 12
+
+# Risks:
+# 1. CPython interns code objects — modifying shared code objects affects all instances
+# 2. The specializing adaptive interpreter (3.11+) assumes bytecode is stable — modifying
+#    bytecode after specialization causes crashes or incorrect behavior
+# 3. No type checking or safety: wrong bytecode causes SystemError or segfault
+# 4. Breaks between CPython versions — bytecode is not a stable API
+```
+
+For legitimate use cases (coverage.py, debuggers, monkey-patching): use `sys.settrace` or `sys.audit` hooks instead of bytecode manipulation. The `bytecode` library provides a safe, version-aware abstraction over raw bytecode modification.
 
 ---
 
 ## Gotcha Follow-ups
 
-**"Can you modify bytecode at runtime to change a function's behavior?"**  
-In older Python versions, you could create a new code object with modified `co_code` and assign it to `func.__code__`. In Python 3.8+, code objects gained `co_code` as a property. In Python 3.11+, `co_code` was split into `co_code` (deprecated) and `co_linetable`, `co_exceptiontable`, etc. Direct bytecode patching is fragile and version-specific. The recommended modern approach is using `dis.Bytecode` + `types.CodeType(...)` to reconstruct. Libraries like `bytecode` (third-party) provide a safer API. This is how some coverage tools work.
+**"Is Python bytecode portable between CPython versions?"**
+No — `.pyc` files embed a magic number (version-specific) in the first 4 bytes. CPython rejects `.pyc` files from a different version. Bytecode opcodes, their encoding, and even their argument semantics change between minor versions (e.g., Python 3.11 added `RESUME`, `PUSH_EXC_INFO`; 3.12 changed to 2-byte "wordcode"). Never distribute `.pyc` files as part of a package — always distribute source.
 
-**"Why does `dis.dis()` show different output on Python 3.10 vs 3.12 for the same code?"**  
-Major changes between versions:
-- **3.10→3.11**: `JUMP_ABSOLUTE` removed, replaced with `JUMP_FORWARD`/`JUMP_BACKWARD`. `CALL_FUNCTION`/`CALL_FUNCTION_KW` replaced with unified `CALL`+`KW_NAMES`. `CACHE` entries appeared. `RESUME` added.
-- **3.11→3.12**: Exception handling bytecode restructured (`PUSH_EXC_INFO`, `COPY_EXCEPTION`). Cleanup of legacy opcodes.
-- Specializing opcodes (`BINARY_OP_ADD_INT`, `LOAD_ATTR_INSTANCE_VALUE`) may or may not appear depending on whether the function has run and been specialized.
-
-Always note the Python version when sharing bytecode analysis.
+**"What is `co_flags` used for?"**
+`co_flags` is a bitmask that tells the VM how to set up a frame:
+- `CO_OPTIMIZED (0x01)`: locals stored as fast locals (array), not dict
+- `CO_NEWLOCALS (0x02)`: function has its own locals namespace
+- `CO_VARARGS (0x04)`: function has `*args`
+- `CO_VARKEYWORDS (0x08)`: function has `**kwargs`
+- `CO_NESTED (0x10)`: nested function
+- `CO_GENERATOR (0x20)`: generator function (`yield` present)
+- `CO_COROUTINE (0x100)`: async def function
+- `CO_ASYNC_GENERATOR (0x200)`: async generator
 
 ---
 
 ## Under the Hood
 
-The bytecode format is defined in `Include/cpython/code.h`. The evaluator loop is `_PyEval_EvalFrameDefault()` in `Python/ceval.c` — a massive `switch(opcode)` statement with computed gotos for performance. In Python 3.11+, this switch became a `DISPATCH_TABLE`-based jump table for lower branch prediction misses.
-
-Code objects are immutable once created. `compile()` → `co_code` is sealed; you can't modify it in-place. To "patch" bytecode, you must create a new `types.CodeType` via its constructor (30+ arguments as of 3.12).
+CPython's execution loop (`Python/ceval.c: _PyEval_EvalFrameDefault()`) is a giant `switch` statement over opcodes (Python 3.11+: computed goto for ~20% speedup on supported compilers). Each frame (`PyFrameObject`) maintains a value stack (array of `PyObject*`), the bytecode pointer (`prev_instr`), and the local variables array (`localsplus`). In Python 3.11+, frames are allocated on the C stack (not heap) for common cases, eliminating allocation overhead. The `.pyc` file format: 4-byte magic, 4-byte flags, 4-byte source timestamp/hash, 4-byte source size, then a marshalled `code` object.

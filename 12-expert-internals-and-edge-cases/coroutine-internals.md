@@ -2,369 +2,438 @@
 
 ## Concept
 
-Python's `async`/`await` is built directly on top of generators. Understanding how generators work at the protocol level explains how coroutines work, what `send()` and `throw()` do, and why cancellation in asyncio propagates the way it does.
+Python's `async`/`await` is syntactic sugar over generators. Understanding the full chain — generator protocol → coroutine protocol → asyncio's event loop driving coroutines — is essential for diagnosing async bugs and understanding performance characteristics.
 
-### Generator Protocol
+### Generators: The Foundation
 
 ```python
-def counter(start=0):
-    value = start
-    while True:
-        received = yield value   # yield suspends AND can receive a value
-        if received is not None:
-            value = received
-        else:
-            value += 1
+def gen():
+    print("Before first yield")
+    value = yield 1           # yields 1 to caller; receives sent value
+    print(f"Received: {value}")
+    yield 2
 
-gen = counter(10)
+g = gen()
 
-print(next(gen))       # 10 — primes the generator (advances to first yield)
-print(next(gen))       # 11 — resumes with implicit send(None)
-print(gen.send(100))   # 100 — sends 100 as the result of yield; received = 100
-print(gen.send(None))  # 101 — normal increment
-gen.throw(ValueError, "stop")  # throws exception at the current yield point
-gen.close()            # throws GeneratorExit
+# Generators are lazy — nothing runs until next():
+result = next(g)              # "Before first yield" printed
+print(result)                 # 1
+
+result = g.send("hello")      # resumes after yield; value="hello"
+print(result)                 # "Received: hello" printed; 2 returned
+
+try:
+    next(g)                   # StopIteration — generator exhausted
+except StopIteration:
+    pass
+
+# Generator protocol:
+# g.__next__() == next(g) — resumes from last yield, sends None
+# g.send(value) — resumes, sends value into the yield expression
+# g.throw(exc) — resumes, raises exc at the yield point
+# g.close() — sends GeneratorExit to the generator
 ```
 
-**The three suspension/resumption operations:**
-- `next(gen)` ≡ `gen.send(None)` — resume, yield's expression evaluates to `None`
-- `gen.send(value)` — resume, yield's expression evaluates to `value`
-- `gen.throw(ExcType, value, tb)` — throw an exception at the current yield point
-- `gen.close()` — throw `GeneratorExit` (generator should not yield again)
+### Generator State Machine
 
-### `yield from` — The Bridge
+```python
+import inspect
 
-`yield from iterable` delegates to another generator or iterable, transparently forwarding `send()` and `throw()` calls:
+def stateful():
+    x = yield "first"
+    y = yield "second"
+    return x + y
+
+g = stateful()
+print(inspect.getgeneratorstate(g))   # GEN_CREATED
+
+next(g)
+print(inspect.getgeneratorstate(g))   # GEN_SUSPENDED
+
+g.send(10)
+print(inspect.getgeneratorstate(g))   # GEN_SUSPENDED
+
+try:
+    g.send(20)
+except StopIteration as e:
+    print(e.value)                     # 30 (return value)
+    print(inspect.getgeneratorstate(g))  # GEN_CLOSED
+```
+
+### `yield from` — Generator Delegation
 
 ```python
 def inner():
-    x = yield 1
-    print(f"inner received: {x}")
-    return "inner result"
+    yield 1
+    yield 2
+    return "inner done"  # return value goes to yield from expression
 
 def outer():
-    result = yield from inner()   # delegates to inner, forwards send/throw
+    result = yield from inner()   # transparently delegates
     print(f"inner returned: {result}")
-    yield 2
+    yield 3
 
-gen = outer()
-print(next(gen))       # 1 — from inner's yield
-print(gen.send(42))    # "inner received: 42", "inner returned: inner result", then 2
+list(outer())   # [1, 2, 3] — inner done printed
+
+# yield from also forwards send() and throw():
+def passthrough():
+    return (yield from subgenerator())
+
+# yield from is the mechanism that makes coroutine chaining work
 ```
 
-`yield from` enables coroutine chaining. When `inner()` returns, the return value becomes the result of `yield from inner()` in `outer`. This is the mechanism that `asyncio` uses to chain coroutines through `await`.
-
-### How `async def` / `await` Maps to Generators
-
-`async def` + `await` is syntactic sugar over `yield from`:
-
-```python
-# These are conceptually equivalent (simplified):
-
-# Generator-based coroutine (pre-3.5 asyncio pattern):
-@asyncio.coroutine
-def old_style():
-    result = yield from asyncio.sleep(1)
-    return result
-
-# async/await (post-3.5):
-async def new_style():
-    result = await asyncio.sleep(1)  # await ≡ yield from (for awaitable objects)
-    return result
-```
-
-Under the hood:
-- `async def` creates a coroutine object with `CO_COROUTINE` flag (not `CO_GENERATOR`).
-- `await expr` calls `expr.__await__()` to get an iterator, then does `yield from` on it.
-- `asyncio.Task.__step()` drives the coroutine via `coro.send(None)` and `coro.throw(exc)`.
-
-### `send()` / `throw()` / `close()` Internals
+### Coroutines: `async def` + `await`
 
 ```python
 import asyncio
-import sys
 
-async def example():
-    try:
-        value = await some_future
-    except asyncio.CancelledError:
-        print("Cancelled! Cleaning up...")
-        raise  # must re-raise
+# async def creates a coroutine function; calling it returns a coroutine OBJECT
+async def my_coro():
+    print("start")
+    await asyncio.sleep(0.1)   # suspends this coroutine, lets others run
+    print("end")
 
-# When task.cancel() is called:
-# 1. task.cancel() sets a cancellation flag
-# 2. At the next iteration, asyncio calls coro.throw(CancelledError)
-# 3. The CancelledError is thrown at the current await point
-# 4. Propagates up through yield from chains to the coroutine's try/except
+# Coroutine is NOT started by calling it:
+coro = my_coro()    # returns coroutine object, nothing printed yet
+print(type(coro))   # <class 'coroutine'>
 
-# Manual demonstration:
-async def waiter():
-    try:
-        await asyncio.sleep(10)
-    except asyncio.CancelledError:
-        print("Got CancelledError via throw()")
-        raise
+# Drive it with asyncio:
+asyncio.run(coro)   # "start" then "end"
+
+# Under the hood: await foo ≡ yield from foo.__await__()
+# asyncio.sleep returns an object with __await__ that yields a Future
+```
+
+### The Awaitable Protocol
+
+```python
+# An awaitable is anything with __await__() returning an iterator
+# The iterator yields Futures or None to the event loop
+
+import asyncio
+import inspect
+
+class Sleep:
+    """Custom awaitable — equivalent to asyncio.sleep."""
+
+    def __init__(self, delay: float):
+        self.delay = delay
+
+    def __await__(self):
+        # Yield a Future to the event loop; resume when Future is done
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        loop.call_later(self.delay, future.set_result, None)
+        yield future   # event loop receives this Future and waits on it
 
 async def main():
-    task = asyncio.create_task(waiter())
-    await asyncio.sleep(0)  # let waiter start
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        print("Task cancelled")
+    print("before sleep")
+    await Sleep(0.1)   # uses our custom awaitable
+    print("after sleep")
+
+asyncio.run(main())
+
+# asyncio.Future is the core: it's what gets yielded up to the event loop.
+# The event loop's .run_forever() loop:
+# 1. Calls next() on the coroutine
+# 2. Receives a Future
+# 3. Registers the Future with the selector (epoll/select)
+# 4. When FD becomes ready, calls Future.set_result()
+# 5. Future.set_result() schedules the coroutine's .send(result) via callbacks
+```
+
+### Frame Objects and Coroutine Suspension
+
+```python
+import asyncio
+
+async def suspended_coro():
+    # Inspect ourselves while suspended
+    import sys
+    frame = sys._current_frames()
+    await asyncio.sleep(0)   # yield to event loop
+
+async def main():
+    coro = suspended_coro()
+    task = asyncio.ensure_future(coro)
+
+    # Before running: coroutine has a frame in GEN_CREATED state
+    print(coro.cr_frame)        # frame object
+    print(coro.cr_running)      # False (not currently executing)
+    print(coro.cr_await)        # None (not awaiting anything yet)
+
+    await asyncio.sleep(0)      # let suspended_coro start
+
+    # Now it's suspended at await asyncio.sleep(0):
+    print(task.get_coro().cr_await)  # asyncio.Task awaiting sleep
+
+# Stack tracing:
+async def trace_stack():
+    import traceback
+    await asyncio.sleep(0)
+    # traceback.print_stack() shows: trace_stack → event loop → ...
 
 asyncio.run(main())
 ```
 
-### StopIteration vs StopAsyncIteration
+### Generator-Based Coroutines (Historical — Python 3.4-3.10)
 
 ```python
-# Regular generator — signals completion via StopIteration:
-def gen():
-    yield 1
-    # implicit: raise StopIteration (or "return" becomes StopIteration(return_value))
+# The original coroutine syntax (still valid but deprecated):
+import asyncio
 
-g = gen()
-next(g)  # 1
-next(g)  # raises StopIteration
+@asyncio.coroutine
+def old_coro():
+    yield from asyncio.sleep(0.1)
+    return "done"
 
-# Async iterator — signals completion via StopAsyncIteration:
-class AsyncRange:
-    def __init__(self, n):
-        self.n = n
-        self.current = 0
+# Modern equivalent:
+async def modern_coro():
+    await asyncio.sleep(0.1)
+    return "done"
 
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        if self.current >= self.n:
-            raise StopAsyncIteration  # NOT StopIteration
-        self.current += 1
-        return self.current
-
-# PEP 479 (Python 3.7+): StopIteration raised inside a coroutine/generator
-# is CONVERTED to RuntimeError to prevent accidental silent termination
-async def bad_coroutine():
-    raise StopIteration("oops")  # RuntimeError: StopIteration raised in coroutine
-```
-
-### Generator Frame Suspension
-
-```python
-import sys
-
-def inspect_generator():
-    gen = (i for i in range(3))
-    
-    next(gen)
-    frame = gen.gi_frame
-    print(f"Generator suspended at line: {frame.f_lineno}")
-    print(f"Generator locals: {frame.f_locals}")
-    print(f"gi_suspended: {gen.gi_suspended}")  # Python 3.12+
-    
-    next(gen)
-    print(f"After second next, frame: {gen.gi_frame}")  # still active
-    
-    list(gen)  # exhaust
-    print(f"Exhausted, frame: {gen.gi_frame}")  # None — frame released
-
-inspect_generator()
+# async def is compiled with CO_COROUTINE flag
+# @asyncio.coroutine sets CO_ITERABLE_COROUTINE via types.coroutine()
 ```
 
 ---
 
 ## Interview Questions
 
-### Q1: Explain the relationship between Python generators and async/await at the protocol level.
+### Q1: How does Python implement `async`/`await` under the hood — what is the relationship to generators?
 
-**Model answer:**  
-`async def` / `await` is syntactic sugar over the generator protocol, with a few key differences:
+**Model answer:**
+`async def` creates a coroutine function. Calling it returns a coroutine object — essentially a generator with `CO_COROUTINE` flag set in `co_flags`. `await expr` compiles to `GET_AWAITABLE` + `SEND` + `YIELD_VALUE` opcodes — equivalent to `yield from expr.__await__()`.
 
-| | Generator (`def` + `yield`) | Coroutine (`async def` + `await`) |
-|-|------------------------------|----------------------------------|
-| Flag | `CO_GENERATOR` | `CO_COROUTINE` |
-| Advance | `next(g)` or `g.send(None)` | `coro.send(None)` via Task |
-| Delegate | `yield from iterable` | `await awaitable` (calls `__await__()`) |
-| Exception | `g.throw(exc)` | `task.cancel()` → `coro.throw(CancelledError)` |
-| Completion | `StopIteration(value)` | `StopIteration(value)` (caught by Task) |
-
-The asyncio `Task` is essentially a driver loop that:
-1. Calls `coro.send(None)` to advance the coroutine.
-2. The coroutine `yield`s a Future (via `await future`'s `__await__` → `yield self`).
-3. Task registers itself as a done callback on the Future.
-4. When the Future resolves, Task calls `coro.send(result)`.
-5. If the Future raised, Task calls `coro.throw(exc)`.
-6. When `StopIteration` is raised, the coroutine is done; Task sets its own result.
-
-`await` compiles to `GET_AWAITABLE` + `SEND` opcodes (3.12+), which implement `yield from` semantics but with additional checks (the object must have `__await__`, and that must return an iterator with `CO_ITERABLE_COROUTINE` flag or similar).
-
-### Q2: What happens if a generator's `close()` is not called? Is it a resource leak?
-
-**Model answer:**  
-If a generator object is garbage collected without being closed, Python calls `close()` automatically via the generator's `tp_finalize`. `close()` throws `GeneratorExit` into the generator, allowing it to clean up `try/finally` blocks.
+The execution model:
+1. The event loop calls `coroutine.send(None)` to start or resume a coroutine.
+2. The coroutine runs until it hits `await`, which eventually yields a `Future` object to the event loop.
+3. The event loop registers a callback on the `Future`.
+4. When the Future resolves (I/O ready, timer fired, etc.), the event loop calls `coroutine.send(result)`.
+5. The coroutine resumes from the `await` point with `result` as the value.
 
 ```python
-def with_cleanup():
+# Equivalent desugaring:
+async def f():
+    x = await g()
+
+# Approximately equivalent to:
+def f():
+    x = yield from g().__await__()
+
+# The event loop is a standard Python generator driver:
+def run(coro):
+    result = None
     try:
-        while True:
-            yield
-    finally:
-        print("Cleaned up!")
-
-gen = with_cleanup()
-next(gen)
-del gen   # triggers tp_finalize → gen.close() → "Cleaned up!" printed
+        future = coro.send(result)
+        # ... register future with selector ...
+        # ... when future resolves, loop back and send result ...
+    except StopIteration as e:
+        return e.value   # coroutine returned
 ```
 
-**However:** In CPython with reference counting, `del gen` immediately calls `tp_finalize` (synchronous). In other runtimes (PyPy) or with reference cycles, cleanup may be delayed until GC. Code relying on generator cleanup for resource management is fragile.
+### Q2: What is an awaitable and how do you create a custom one?
 
-**Best practice:** Explicitly close generators when done with them:
+**Model answer:**
+An awaitable is any object with `__await__()` returning an iterator. The iterator yields control to the event loop (by yielding `Future` objects or `None`) and receives results via `send()`.
+
+Three standard awaitables:
+1. **Coroutine objects** (from `async def`)
+2. **`asyncio.Future`** objects
+3. **`asyncio.Task`** (wraps a coroutine, drives it, acts as Future)
+
+Custom awaitable:
+
 ```python
-gen = my_generator()
-try:
-    for item in gen:
-        process(item)
-finally:
-    gen.close()  # explicit cleanup
+class Awaitable:
+    def __init__(self, result_value):
+        self._result = result_value
 
-# Or use contextlib.closing:
-from contextlib import closing
-with closing(my_generator()) as gen:
-    for item in gen:
-        process(item)
+    def __await__(self):
+        # A "trivial" awaitable that doesn't suspend:
+        return iter([])    # empty iterator — no suspension
+        yield   # unreachable — makes this a generator (required for yield-based protocol)
+        return self._result   # StopIteration.value
+
+# Or using asyncio.Future for actual suspension:
+class DelayedResult:
+    def __init__(self, value, delay):
+        self.value = value
+        self.delay = delay
+
+    def __await__(self):
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future = loop.create_future()
+        loop.call_later(self.delay, future.set_result, self.value)
+        result = yield future   # suspend; receive result when future resolves
+        return result
+
+async def main():
+    result = await DelayedResult("hello", 0.1)
+    print(result)   # "hello" after 0.1 seconds
 ```
 
-### Q3: What is `PEP 479` and why does it matter?
+### Q3: What is `asyncio.Task` and how does it drive a coroutine?
 
-**Model answer:**  
-**PEP 479** (Python 3.7+, was `__future__` in 3.5-3.6) changed how `StopIteration` behaves inside generators and coroutines.
+**Model answer:**
+`asyncio.Task` is a thin wrapper around a coroutine that implements the `Future` protocol. It drives the coroutine by chaining callbacks:
 
-**Before PEP 479:** If `StopIteration` was raised inside a generator (accidentally or intentionally), it would silently terminate the generator:
+1. At creation, `Task.__step()` is scheduled immediately via `loop.call_soon()`.
+2. `__step()` calls `coro.send(None)` or `coro.send(result)`.
+3. If the coroutine yields a `Future`, `Task` adds itself as a done callback on that `Future` via `future.add_done_callback(self.__step)`.
+4. When the `Future` resolves, `__step()` is called again with the result.
+5. If `coro.send()` raises `StopIteration`, the coroutine is done — `Task.set_result()` is called.
+
 ```python
-def gen(it):
-    for x in it:
-        next(it)  # accidentally exhausts iterator: StopIteration silently ends gen
-        yield x
+# Simplified Task implementation:
+class SimpleTask:
+    def __init__(self, coro, loop):
+        self._coro = coro
+        self._loop = loop
+        self._result = None
+        self._done = False
+        self._callbacks = []
+        loop.call_soon(self.__step)
+
+    def __step(self, exc=None):
+        try:
+            if exc:
+                future = self._coro.throw(type(exc), exc)
+            else:
+                future = self._coro.send(self._result)
+            future.add_done_callback(self.__wakeup)
+        except StopIteration as e:
+            self._result = e.value
+            self._done = True
+            for cb in self._callbacks:
+                cb(self)
+
+    def __wakeup(self, future):
+        try:
+            self._result = future.result()
+        except Exception as exc:
+            self.__step(exc=exc)
+        else:
+            self.__step()
 ```
 
-This caused extremely hard-to-debug bugs where exceptions were accidentally swallowed.
+### Q4: What's the difference between `asyncio.gather`, `asyncio.create_task`, and `asyncio.wait`?
 
-**After PEP 479:** `StopIteration` raised inside a generator is converted to `RuntimeError: generator raised StopIteration`. This makes the bug visible instead of silently incorrect.
-
-For coroutines, `StopAsyncIteration` raised inside an `async for` loop's `__anext__` is the correct way to signal async iteration end. `StopIteration` inside a coroutine raises `RuntimeError`.
-
-**Interview significance:** Shows understanding of how the generator protocol interacts with exception handling and why Python's async model requires `StopAsyncIteration` instead of `StopIteration`.
-
-### Q4: What does `gen.throw()` do and how is it used in asyncio cancellation?
-
-**Model answer:**  
-`gen.throw(ExcType, value=None, traceback=None)` throws an exception into the generator at its current suspension point (the `yield` expression). If the generator catches it and yields again, `throw()` returns the yielded value. If the exception propagates out of the generator, `throw()` re-raises it.
-
-In asyncio:
-1. `task.cancel()` sets `_must_cancel = True` on the Task.
-2. At the next `__step()` call, Task calls `coro.throw(CancelledError())`.
-3. `CancelledError` is thrown at the current `await` point in the coroutine.
-4. If the coroutine has a `try/except CancelledError`, it can run cleanup.
-5. The coroutine MUST re-raise `CancelledError` — swallowing it makes cancellation invisible and breaks structured concurrency.
+**Model answer:**
 
 ```python
 import asyncio
 
-async def careful():
-    async with some_async_resource() as r:
-        try:
-            await asyncio.sleep(100)
-        except asyncio.CancelledError:
-            await r.flush()    # cleanup before cancellation
-            raise              # MUST re-raise
+async def work(n):
+    await asyncio.sleep(n)
+    return n
 
-# asyncio.shield() prevents throw() from reaching the inner coroutine:
-async def protected():
-    try:
-        result = await asyncio.shield(careful())
-    except asyncio.CancelledError:
-        # careful() was NOT cancelled; only the shield wrapper was
-        pass
+# asyncio.gather: run coroutines concurrently, return results in ORDER
+results = await asyncio.gather(work(1), work(2), work(3))
+print(results)   # [1, 2, 3] — same order as input, not completion order
+
+# asyncio.create_task: schedule coroutine immediately, return Task
+# Tasks run concurrently without needing to await them:
+t1 = asyncio.create_task(work(1))
+t2 = asyncio.create_task(work(2))
+r1 = await t1
+r2 = await t2
+
+# asyncio.wait: wait for a set of tasks, with timeout and return conditions
+done, pending = await asyncio.wait(
+    [asyncio.create_task(work(1)), asyncio.create_task(work(5))],
+    timeout=2.0,
+    return_when=asyncio.FIRST_COMPLETED,
+)
+for task in done:
+    print(task.result())   # only the 1-second task completed
+for task in pending:
+    task.cancel()
+
+# asyncio.TaskGroup (Python 3.11+): structured concurrency with error propagation
+async with asyncio.TaskGroup() as tg:
+    t1 = tg.create_task(work(1))
+    t2 = tg.create_task(work(2))
+# All tasks complete here; exceptions from any task cancel all others
 ```
 
-### Q5: How do async generators work? What protocol do they implement?
+Key difference: `gather` is for "I need all results"; `wait` is for "I need some results or timeout"; `TaskGroup` is for structured concurrency with proper cancellation.
 
-**Model answer:**  
-Async generators combine `async def` with `yield`. They implement `__aiter__` and `__anext__` automatically:
+### Q5: How does `async for` and `async with` work under the hood?
+
+**Model answer:**
 
 ```python
-async def async_range(n: int):
-    for i in range(n):
-        await asyncio.sleep(0)  # can await inside
-        yield i                  # AND yield
-
-async def main():
-    async for value in async_range(5):
-        print(value)
-
-# What it compiles to protocol-wise:
-class _AsyncRange:
+# async for requires __aiter__() and __anext__()
+class AsyncRange:
     def __init__(self, n):
-        self._n = n
-        self._i = 0
+        self.n = n
+        self.i = 0
 
     def __aiter__(self):
-        return self
+        return self   # async iterators are their own async iterables
 
     async def __anext__(self):
-        if self._i >= self._n:
-            raise StopAsyncIteration
-        await asyncio.sleep(0)
-        result = self._i
-        self._i += 1
-        return result
-```
+        if self.i >= self.n:
+            raise StopAsyncIteration   # signals end of async iteration
+        await asyncio.sleep(0)        # simulate async work
+        val = self.i
+        self.i += 1
+        return val
 
-Key differences from regular generators:
-- `yield` in an `async def` creates an async generator (not a coroutine).
-- You cannot `await` an async generator directly — use `async for`.
-- Closing an async generator calls `aclose()`, which throws `GeneratorExit` asynchronously.
-- Finalization: `sys.set_asyncgen_hooks()` lets the event loop manage async generator cleanup.
+async def consume():
+    async for val in AsyncRange(3):
+        print(val)   # 0, 1, 2
 
-```python
-# Async generator with cleanup:
-async def resource_generator():
-    resource = acquire()
+# Desugared:
+async def consume_desugared():
+    it = AsyncRange(3).__aiter__()
+    while True:
+        try:
+            val = await it.__anext__()
+            print(val)
+        except StopAsyncIteration:
+            break
+
+# async with requires __aenter__() and __aexit__()
+class AsyncResource:
+    async def __aenter__(self):
+        print("acquiring resource")
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        print("releasing resource")
+        return False   # don't suppress exceptions
+
+async def use_resource():
+    async with AsyncResource() as r:
+        print("using resource")
+
+# Desugared:
+async def use_resource_desugared():
+    mgr = AsyncResource()
+    resource = await mgr.__aenter__()
     try:
-        for item in resource.items():
-            await asyncio.sleep(0)
-            yield item
-    finally:
-        await resource.aclose()  # async cleanup on .aclose() call
+        print("using resource")
+    except BaseException as exc:
+        if not await mgr.__aexit__(type(exc), exc, exc.__traceback__):
+            raise
+    else:
+        await mgr.__aexit__(None, None, None)
 ```
 
 ---
 
 ## Gotcha Follow-ups
 
-**"What happens if you raise `StopIteration` inside a `try/finally` block in a generator?"**  
-In Python 3.7+ (PEP 479), `StopIteration` inside a generator is converted to `RuntimeError`. This `RuntimeError` propagates normally — the `finally` block runs (as always with exceptions), and then the `RuntimeError` propagates out. The generator terminates with an exception. This is usually a bug: something called `next()` on an iterator and got a `StopIteration`, which escaped into the generator body.
+**"Why does `asyncio.run(coro)` fail if called from inside a running event loop?"**
+`asyncio.run()` creates a NEW event loop and runs it to completion. If called inside a running event loop (e.g., in Jupyter, or in an async function), it raises `RuntimeError: This event loop is already running`. Solution: use `await coro` directly, or `asyncio.create_task(coro)`, or use `nest_asyncio.apply()` in Jupyter. In libraries that must work in both sync and async contexts, expose both `sync_fn()` and `async_fn()` versions.
 
-**"Can you use `send()` on the first call to a generator?"**  
-Only `send(None)` is valid as the first call (equivalent to `next()`). `send(non_None_value)` on an un-started generator raises `TypeError: can't send non-None value to a just-started generator`. This is because there's no `yield` expression that has suspended to receive the value — the generator hasn't run at all yet. The standard pattern for generators that need to receive an initial value is to call `next(gen)` once to prime it (advance to the first `yield`), then use `send()`.
+**"What happens if you forget `await` on a coroutine?"**
+The coroutine object is created but never driven — it's immediately garbage-collected. Python 3.8+ emits `RuntimeWarning: coroutine 'X' was never awaited`. The async function appears to run but does nothing. This is one of the most common bugs in async Python code. Solution: always `await` coroutines, or explicitly `asyncio.create_task()` them (and keep a reference to the task to prevent premature GC).
 
 ---
 
 ## Under the Hood
 
-Generator objects are `PyGenObject` in `Objects/genobject.c`. Key fields:
-- `gi_frame` — the suspended `_PyInterpreterFrame`
-- `gi_code` — the code object
-- `gi_yieldfrom` — the object currently delegated to via `yield from` (non-NULL when inside `yield from`)
-
-`gen.send(value)` calls `_gen_send_ex()`:
-1. If `gi_frame` is NULL: generator is exhausted, raise `StopIteration`.
-2. If generator is already running (recursive `next()`): raise `ValueError`.
-3. Sets `gi_frame.localsplus[-1]` (the pending value slot) to `value`.
-4. Calls `_PyEval_EvalFrameDefault(frame)`.
-5. When the frame yields, the yielded value is returned.
-6. When the frame returns (coroutine completes), `StopIteration(return_value)` is raised.
-
-Coroutines (`PyCoroObject`) and async generators (`PyAsyncGenObject`) share the same underlying structure via a common header.
+Coroutine objects are `PyCoroObject` (`Include/cpython/genobject.h`), sharing the same structure as `PyGenObject` (generators) and `PyAsyncGenObject` (async generators). The `CO_COROUTINE` flag in `co_flags` is what distinguishes a coroutine code object from a generator. `await` compiles to `GET_AWAITABLE` (calls `__await__()` and verifies the result is a generator/coroutine) followed by `SEND` (like `yield from` — drives the sub-iterator until StopIteration). The event loop (`asyncio/base_events.py: BaseEventLoop._run_once()`) uses `selectors.select()` on a timeout equal to the next scheduled callback, then processes all ready callbacks. `asyncio.Future` (`asyncio/futures.py`) uses `__await__` returning `self` — when `yield self` is received by the event loop (via `Task.__step`), the Task adds a done callback.

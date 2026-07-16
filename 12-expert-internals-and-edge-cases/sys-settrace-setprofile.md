@@ -2,400 +2,428 @@
 
 ## Concept
 
-Python provides two hooks that allow arbitrary code to be called as the interpreter executes Python code. These are the foundation for debuggers (`pdb`), coverage tools (`coverage.py`), profilers, and tracing frameworks.
+`sys.settrace` and `sys.setprofile` are the hooks that make Python's debugger (pdb), coverage tool (coverage.py), and profilers (cProfile) work. They install callback functions that CPython calls at specific execution events. Understanding them is essential for building observability tools and understanding their performance impact.
 
-### `sys.settrace` — Per-Line Execution Hook
-
-`sys.settrace(tracefunc)` installs a trace function called for every:
-- `call` event — function is called
-- `line` event — interpreter is about to execute a line
-- `return` event — function is about to return
-- `exception` event — an exception has occurred
+### `sys.settrace` — Line-Level Tracing
 
 ```python
 import sys
 
-call_count = {}
-line_count = {}
-
-def tracer(frame, event, arg):
-    """Called for every call/line/return/exception event."""
+def my_trace(frame, event, arg):
+    """
+    Called at every:
+    - 'call'    : function entry (arg=None)
+    - 'line'    : before each line executes (arg=None)
+    - 'return'  : function exit (arg=return value)
+    - 'exception': unhandled exception (arg=(exc_type, exc_value, traceback))
+    """
     code = frame.f_code
-    func_name = code.co_name
     filename = code.co_filename
     lineno = frame.f_lineno
+    funcname = code.co_name
 
-    if event == 'call':
-        call_count[func_name] = call_count.get(func_name, 0) + 1
-        return tracer  # MUST return a trace function to trace inside this function
-                       # Return None to stop tracing inside this function
+    print(f"[{event:10s}] {funcname}:{lineno}")
 
-    elif event == 'line':
-        key = (filename, lineno)
-        line_count[key] = line_count.get(key, 0) + 1
-        return tracer
+    # Return the trace function for line/return events in THIS frame.
+    # Return None to stop tracing this frame.
+    return my_trace
 
-    elif event == 'return':
-        pass  # arg is the return value
+sys.settrace(my_trace)
 
-    elif event == 'exception':
-        exc_type, exc_value, exc_traceback = arg
+def sample():
+    x = 1      # 'line' event
+    y = x + 1  # 'line' event
+    return y   # 'line' + 'return' events
 
-    return tracer
-
-def target_function():
-    x = 1
-    y = x + 1
-    return y
-
-sys.settrace(tracer)
-result = target_function()
-sys.settrace(None)  # disable tracing
-
-print("Function calls:", call_count)
-print("Lines executed:", line_count)
+sample()
+sys.settrace(None)   # remove tracing
 ```
 
-**Critical:** The trace function for the `call` event must return a callable to trace INSIDE that function. Returning `None` means that specific function call won't be traced (optimization).
+### Per-Frame Trace Function
 
-### `sys.setprofile` — Call/Return Hook (Profiling)
+```python
+import sys
 
-`sys.setprofile(profilefunc)` is similar but only fires on:
-- `call` — function called
-- `return` — function returning
-- `c_call` — C function about to be called
-- `c_return` — C function returning
-- `c_exception` — C function raised an exception
+def outer_trace(frame, event, arg):
+    """Trace function for module level / outer calls."""
+    if event == 'call':
+        funcname = frame.f_code.co_name
+        if funcname == 'interesting_function':
+            # Install a per-frame tracer for THIS function only:
+            return inner_trace
+    return None   # don't trace other functions
 
-Does NOT fire for `line` events — much lower overhead than `settrace`.
+def inner_trace(frame, event, arg):
+    """Trace function installed for interesting_function's frame."""
+    if event == 'line':
+        print(f"  executing line {frame.f_lineno}")
+    elif event == 'return':
+        print(f"  returning: {arg}")
+    return inner_trace   # keep tracing this frame
+
+sys.settrace(outer_trace)
+
+def boring():
+    x = 1   # not traced
+
+def interesting_function():
+    a = 1   # traced: "executing line N"
+    b = 2   # traced
+    return a + b   # traced: "returning: 3"
+
+boring()
+interesting_function()
+
+sys.settrace(None)
+```
+
+### Building a Simple Code Coverage Tool
+
+```python
+import sys
+from collections import defaultdict
+
+class CoverageTracer:
+    """Tracks which lines of which files are executed."""
+
+    def __init__(self):
+        self.covered: dict[str, set[int]] = defaultdict(set)
+
+    def trace_calls(self, frame, event, arg):
+        if event == 'call':
+            return self.trace_lines   # install line tracer for this frame
+        return None
+
+    def trace_lines(self, frame, event, arg):
+        if event == 'line':
+            filename = frame.f_code.co_filename
+            lineno = frame.f_lineno
+            self.covered[filename].add(lineno)
+        return self.trace_lines
+
+    def __enter__(self):
+        sys.settrace(self.trace_calls)
+        return self
+
+    def __exit__(self, *args):
+        sys.settrace(None)
+
+    def report(self) -> dict[str, float]:
+        """Coverage percentage per file."""
+        # Real coverage.py also tracks which lines are executable (via ast/compile)
+        return {
+            filename: len(lines)
+            for filename, lines in self.covered.items()
+        }
+
+with CoverageTracer() as tracer:
+    def example():
+        x = 1
+        if x > 0:
+            return "positive"
+        return "non-positive"   # never executed
+
+    example()
+
+print(tracer.report())
+```
+
+### `sys.setprofile` — Function-Level Profiling
 
 ```python
 import sys
 import time
+from collections import defaultdict
 
-_call_times = {}
-_call_stack = []
+def my_profile(frame, event, arg):
+    """
+    Called at:
+    - 'call'     : Python function entry
+    - 'return'   : Python function exit
+    - 'c_call'   : C function entry (arg=C function object)
+    - 'c_return' : C function exit
+    - 'c_exception': C function raised exception
+    
+    NOTE: 'line' events are NOT fired for sys.setprofile.
+    """
+    funcname = frame.f_code.co_name
+    print(f"[{event:12}] {funcname}")
 
-def profiler(frame, event, arg):
-    func_name = f"{frame.f_code.co_filename}:{frame.f_code.co_name}"
+sys.setprofile(my_profile)
 
-    if event == 'call':
-        _call_stack.append((func_name, time.perf_counter_ns()))
+def a():
+    len([1, 2, 3])   # c_call / c_return for len()
+    return 1
 
-    elif event == 'return':
-        if _call_stack and _call_stack[-1][0] == func_name:
-            name, start = _call_stack.pop()
-            elapsed = time.perf_counter_ns() - start
-            _call_times[name] = _call_times.get(name, 0) + elapsed
-
-sys.setprofile(profiler)
-# ... code to profile ...
+a()
 sys.setprofile(None)
 
-for func, ns in sorted(_call_times.items(), key=lambda x: -x[1])[:10]:
-    print(f"{func}: {ns/1e6:.2f}ms")
+# Output:
+# [call        ] a
+# [c_call      ] a    (arg=<built-in function len>)
+# [c_return    ] a
+# [return      ] a
 ```
 
-### How `coverage.py` Works
-
-`coverage.py` uses `sys.settrace` to track which lines are executed:
+### Building a Simple Call Profiler
 
 ```python
 import sys
+import time
+from collections import defaultdict
+from contextlib import contextmanager
 
-class CoverageCollector:
+class SimpleProfiler:
     def __init__(self):
-        self.executed_lines = {}  # {filename: {lineno, ...}}
+        self._call_counts: dict[str, int] = defaultdict(int)
+        self._total_time: dict[str, float] = defaultdict(float)
+        self._call_stack: list[tuple[str, float]] = []
 
-    def trace(self, frame, event, arg):
-        if event == 'line':
-            filename = frame.f_code.co_filename
-            lineno = frame.f_lineno
-            if filename not in self.executed_lines:
-                self.executed_lines[filename] = set()
-            self.executed_lines[filename].add(lineno)
-        return self.trace  # return self to continue tracing
+    def profile(self, frame, event, arg):
+        if event in ('call', 'c_call'):
+            name = (frame.f_code.co_qualname if event == 'call'
+                    else getattr(arg, '__name__', str(arg)))
+            self._call_stack.append((name, time.perf_counter()))
 
-    def start(self):
-        sys.settrace(self.trace)
+        elif event in ('return', 'c_return', 'c_exception'):
+            if self._call_stack:
+                name, start = self._call_stack.pop()
+                elapsed = time.perf_counter() - start
+                self._call_counts[name] += 1
+                self._total_time[name] += elapsed
 
-    def stop(self):
-        sys.settrace(None)
-        # Also need to reset per-thread: threading.settrace(None)
+    @contextmanager
+    def __call__(self):
+        sys.setprofile(self.profile)
+        try:
+            yield self
+        finally:
+            sys.setprofile(None)
 
-collector = CoverageCollector()
-collector.start()
+    def report(self, top_n: int = 10):
+        sorted_by_time = sorted(
+            self._total_time.items(), key=lambda kv: kv[1], reverse=True
+        )
+        print(f"{'Function':<40} {'Calls':>8} {'Total(s)':>10}")
+        print("-" * 60)
+        for name, total in sorted_by_time[:top_n]:
+            calls = self._call_counts[name]
+            print(f"{name:<40} {calls:>8} {total:>10.4f}")
 
-# Code under measurement:
-def add(a, b):
-    return a + b  # this line gets marked as covered when called
+profiler = SimpleProfiler()
+with profiler():
+    import json
+    data = [{"key": i, "value": i * 2} for i in range(1000)]
+    json.dumps(data)
 
-result = add(1, 2)
-
-collector.stop()
-print(collector.executed_lines)
+profiler.report()
 ```
 
-**Why `coverage.py` is slow:** The `line` event fires for EVERY line executed. For tight loops, this is called millions of times. `coverage.py` adds ~3-10x overhead to well-optimized code.
-
-### How `pdb` Works
-
-`pdb` (Python Debugger) uses `sys.settrace` to pause execution at breakpoints:
+### Performance Impact of Tracing
 
 ```python
-import sys
+import sys, timeit
 
-class SimpleDebugger:
-    def __init__(self):
-        self.breakpoints = set()
+def work():
+    total = 0
+    for i in range(1000):
+        total += i
+    return total
 
-    def set_breakpoint(self, filename, lineno):
-        self.breakpoints.add((filename, lineno))
+# Baseline (no tracing):
+t_baseline = timeit.timeit(work, number=100)
 
-    def trace(self, frame, event, arg):
-        if event == 'line':
-            key = (frame.f_code.co_filename, frame.f_lineno)
-            if key in self.breakpoints:
-                self.pause(frame)
-        return self.trace
+# With settrace:
+def noop_trace(frame, event, arg):
+    return noop_trace
 
-    def pause(self, frame):
-        print(f"\nBreakpoint hit at {frame.f_code.co_filename}:{frame.f_lineno}")
-        print(f"Locals: {frame.f_locals}")
-        cmd = input("(n)ext, (c)ontinue, (q)uit: ")
-        if cmd == 'q':
-            sys.settrace(None)
+sys.settrace(noop_trace)
+t_traced = timeit.timeit(work, number=100)
+sys.settrace(None)
 
-    def run(self, code_str):
-        sys.settrace(self.trace)
-        exec(code_str)
-        sys.settrace(None)
+print(f"No trace:  {t_baseline:.3f}s")
+print(f"Traced:    {t_traced:.3f}s")
+print(f"Overhead:  {t_traced / t_baseline:.1f}x")
+# Typically 3-10x slower with settrace (per-line callback overhead)
+
+# sys.setprofile is cheaper (~2x overhead) — only fires on call/return
+# py-spy (sampling profiler) has <1% overhead — no callbacks, reads from memory
 ```
-
-`pdb.set_trace()` calls `sys.settrace` and then raises an exception that the trace function catches to pause at the current line. Newer Python (`breakpoint()` built-in, Python 3.7+) calls `sys.breakpointhook()` which defaults to `pdb.set_trace()` but can be overridden.
-
-### Thread-Local Tracing
-
-Each thread has its own trace function. `sys.settrace` only sets it for the calling thread. To trace all threads:
-
-```python
-import sys
-import threading
-
-def trace_func(frame, event, arg):
-    ...
-
-sys.settrace(trace_func)         # current thread
-threading.settrace(trace_func)   # future threads
-```
-
-`sys.gettrace()` returns the current thread's trace function.
-
-### Python 3.12 `sys.monitoring` — The Modern API
-
-Python 3.12 added `sys.monitoring` (PEP 669) as a more efficient replacement for `sys.settrace`:
-
-```python
-import sys
-
-TOOL_ID = 1  # your tool's ID (1-5 for user tools)
-
-def line_handler(code, line_number):
-    print(f"Line {line_number} in {code.co_name}")
-
-sys.monitoring.use_tool_id(TOOL_ID, "my_tracer")
-sys.monitoring.register_callback(TOOL_ID, sys.monitoring.events.LINE, line_handler)
-sys.monitoring.set_events(TOOL_ID, sys.monitoring.events.LINE)
-
-def my_function():
-    x = 1
-    y = x + 1
-    return y
-
-my_function()  # triggers line_handler for each line
-
-sys.monitoring.set_events(TOOL_ID, 0)  # disable
-sys.monitoring.free_tool_id(TOOL_ID)
-```
-
-`sys.monitoring` is significantly faster than `sys.settrace` because:
-1. It uses specialized bytecode (`INSTRUMENTED_*` opcodes) instead of checking a hook at every opcode.
-2. Events can be selectively enabled per-code-object.
-3. No per-event Python function call overhead when events are disabled.
 
 ---
 
 ## Interview Questions
 
-### Q1: How does `sys.settrace` impose overhead, and why does `coverage.py` slow down code so much?
+### Q1: How does `coverage.py` use `sys.settrace` to track which lines are executed?
 
-**Model answer:**  
-`sys.settrace` installs a per-thread trace function that the bytecode evaluator calls at every `line`, `call`, and `return` event. For `line` events:
+**Model answer:**
+`coverage.py` installs a trace function via `sys.settrace`. On `call` events, it installs a per-frame line tracer. On `line` events, it records `(filename, lineno)` in a dictionary.
 
-1. At every `LINE` bytecode (`RESUME` in 3.11+), the evaluator checks if a trace function is set.
-2. If yes, it calls it — a full Python function call with frame object creation.
-3. The trace function executes its Python body.
-4. Control returns to the evaluator.
+Key implementation details:
+1. **Compile-time line analysis:** `coverage.py` also compiles the source and uses the `dis` module to identify which lines are "executable" (have bytecode). This separates blank lines, comments, and pass-only blocks from lines that can be "missed."
+2. **Branch coverage:** tracks `(from_lineno, to_lineno)` pairs for conditional jumps by detecting `JUMP_*` opcodes via the `.pyc` line table.
+3. **`.coverage` data file:** records coverage data in an SQLite database.
+4. **C extension integration:** `coverage.py` uses a C extension (`_coverage.c`) for the actual trace hook to minimize per-line overhead.
 
-This overhead applies to every single line of Python code. For a tight loop running 10M iterations, that's 10M Python function calls just for coverage tracking. Coverage.py adds:
-- ~3x overhead for I/O-bound code (I/O dominates, trace overhead amortizes)
-- ~5-10x overhead for CPU-bound pure Python (every line tracked)
+```python
+# Simplified coverage.py trace:
+class CoverageHook:
+    def __init__(self):
+        self.lines = defaultdict(set)
 
-**Why line events are so expensive:** The frame object must be fully initialized (or at least partially), and each trace call must navigate the Python/C boundary.
+    def __call__(self, frame, event, arg):
+        if event == 'call':
+            return self  # trace this frame
+        if event == 'line':
+            self.lines[frame.f_code.co_filename].add(frame.f_lineno)
+        return self
 
-**Coverage.py's optimizations:**
-- Uses C extension (`_coverage_tracer`) for the trace function instead of Python.
-- Skips files matching excludes.
-- In Python 3.12+, uses `sys.monitoring` instead of `sys.settrace` for much lower overhead.
+hook = CoverageHook()
+sys.settrace(hook)
+# ... run code ...
+sys.settrace(None)
+```
 
-### Q2: Implement a minimal function call logger using `sys.settrace`.
+### Q2: How does pdb (the Python debugger) use `sys.settrace` to implement breakpoints and stepping?
 
-**Model answer:**  
+**Model answer:**
+pdb installs a trace function and uses it to:
+- **Breakpoints:** record `(filename, lineno)` pairs. On `line` events, check if the current `(filename, lineno)` is in the breakpoint set; if so, pause and enter interactive mode.
+- **Stepping (n/s):** on `return` from the current function or on the next `line` event in the current frame, pause.
+- **Step-into (s):** on the next `call` event, pause.
+- **Continue (c):** resume without pausing until the next breakpoint.
+
 ```python
 import sys
-from contextlib import contextmanager
+import bdb   # base debugger class
 
-class CallLogger:
-    def __init__(self):
-        self.calls = []
-        self._depth = 0
+# pdb inherits from bdb.Bdb which manages the settrace hook:
+class SimplePdb(bdb.Bdb):
+    def user_line(self, frame):
+        """Called on each line when we should pause."""
+        filename = frame.f_code.co_filename
+        lineno = frame.f_lineno
+        print(f"Stopped at {filename}:{lineno}")
+        cmd = input("(debug) > ")
+        if cmd == 'p':
+            print(eval(input("Eval: "), frame.f_globals, frame.f_locals))
+        # real pdb has a full command parser here
+
+# The key trace function (simplified from bdb):
+def bdb_trace(frame, event, arg):
+    if event == 'line':
+        if is_breakpoint(frame.f_code.co_filename, frame.f_lineno):
+            pause_execution(frame)   # drop into interactive mode
+    return bdb_trace
+```
+
+### Q3: What's the performance difference between `sys.settrace` and `sys.setprofile`, and why does py-spy not use either?
+
+**Model answer:**
+
+| | `sys.settrace` | `sys.setprofile` | py-spy |
+|-|---------------|-----------------|--------|
+| Fires on | every line | call/return only | never (sampling) |
+| Overhead | 3-10x slowdown | ~2x slowdown | <1% |
+| Accuracy | 100% (deterministic) | 100% (deterministic) | statistical |
+| Production-safe | No | Borderline | Yes |
+
+`sys.settrace` fires on EVERY line, making it expensive — each callback invocation involves Python object creation, dict lookups, and the Python function call overhead. For a function with 100 lines called 1000 times, that's 100,000 trace callbacks.
+
+`sys.setprofile` only fires on function entry/exit — cheaper, but no line-level information.
+
+**py-spy** is a sampling profiler: it reads the target Python process's memory via OS APIs (`ptrace` on Linux, `task_for_pid` on macOS). At configurable intervals (~200Hz), it reads `PyThreadState->frame` to find the current frame stack — without ANY cooperation from the Python interpreter. No callback overhead, no modified Python code, no `sys.settrace`. The trade-off: it misses fast functions (called and returned between two sample points) and has ~0.5% statistical error.
+
+### Q4: Can you use `sys.settrace` to modify the behavior of running code?
+
+**Model answer:**
+Yes — with care. The trace function can modify `frame.f_locals` (then force it back to the C array via `ctypes`), raise exceptions at arbitrary points, or redirect execution by modifying `frame.f_lineno` (pdb uses this for jump/next commands):
+
+```python
+import sys, ctypes
+
+def mutating_trace(frame, event, arg):
+    if event == 'line' and frame.f_code.co_name == 'target':
+        # Modify a local variable mid-execution:
+        frame.f_locals['x'] = 99
+        ctypes.pythonapi.PyFrame_LocalsToFast(
+            ctypes.py_object(frame), ctypes.c_int(0)
+        )
+    return mutating_trace
+
+sys.settrace(mutating_trace)
+
+def target():
+    x = 1      # x will be set to 99 by tracer before x+1 executes
+    return x + 1
+
+print(target())   # 100, not 2!
+
+sys.settrace(None)
+```
+
+This is how debuggers implement variable modification mid-execution. The `frame.f_lineno` trick is used for `jump` in pdb:
+
+```python
+# In pdb's 'jump' command:
+frame.f_lineno = target_line   # redirect execution to a different line
+```
+
+### Q5: How does the `@profile` decorator from memory_profiler work compared to `sys.settrace`?
+
+**Model answer:**
+`memory_profiler`'s `@profile` uses `sys.settrace` with additional calls to `tracemalloc` (or `/proc/self/status` on Linux) to read memory usage on each line:
+
+```python
+# Simplified memory_profiler approach:
+import sys, tracemalloc
+
+class MemoryLineProfiler:
+    def __init__(self, func):
+        self.func = func
+        self.line_memory: dict[int, float] = {}
 
     def trace(self, frame, event, arg):
-        code = frame.f_code
-        name = f"{code.co_filename}:{code.co_name}"
-
-        if event == 'call':
-            self._depth += 1
-            self.calls.append({
-                'type': 'call',
-                'depth': self._depth,
-                'function': name,
-                'line': frame.f_lineno,
-                'args': frame.f_locals.copy()  # snapshot locals at call time
-            })
-            return self.trace  # continue tracing inside this function
-
-        elif event == 'return':
-            self.calls.append({
-                'type': 'return',
-                'depth': self._depth,
-                'function': name,
-                'value': repr(arg)[:50]  # truncate large return values
-            })
-            self._depth -= 1
-
+        if event == 'line' and frame.f_code == self.func.__code__:
+            snapshot = tracemalloc.take_snapshot()
+            stats = snapshot.statistics('lineno')
+            total = sum(s.size for s in stats if s.traceback[0].lineno == frame.f_lineno)
+            self.line_memory[frame.f_lineno] = total / 1024 / 1024  # MiB
         return self.trace
 
-@contextmanager
-def trace_calls():
-    logger = CallLogger()
-    sys.settrace(logger.trace)
-    try:
-        yield logger
-    finally:
-        sys.settrace(None)
+    def __call__(self, *args, **kwargs):
+        tracemalloc.start()
+        old_trace = sys.gettrace()
+        sys.settrace(self.trace)
+        result = self.func(*args, **kwargs)
+        sys.settrace(old_trace)
+        tracemalloc.stop()
+        return result
 
-def add(a, b):
-    return a + b
+@MemoryLineProfiler
+def memory_heavy():
+    data = [0] * 1_000_000   # large allocation
+    result = sum(data)
+    del data
+    return result
 
-def compute():
-    return add(1, 2) + add(3, 4)
-
-with trace_calls() as logger:
-    result = compute()
-
-for call in logger.calls:
-    indent = "  " * call['depth']
-    print(f"{indent}{call['type']}: {call['function']}")
+memory_heavy()
 ```
 
-### Q3: What's the difference between `sys.settrace` and `sys.setprofile`? When would you use each?
-
-**Model answer:**  
-
-| | `sys.settrace` | `sys.setprofile` |
-|-|----------------|-----------------|
-| Events | call, line, return, exception | call, return, c_call, c_return, c_exception |
-| Overhead | High (every line) | Low (only call/return) |
-| C extensions | Only Python-level | Also C functions |
-| Use cases | Debuggers, coverage | Profilers |
-
-**Use `sys.settrace` when:** You need per-line granularity — debugging (need to know WHAT line was executed), coverage analysis (which lines ran), or step-through debuggers.
-
-**Use `sys.setprofile` when:** You only need call/return information — profiling function call counts and durations. Much lower overhead. Can also detect C extension calls (C functions are opaque to `settrace`).
-
-For production-grade profilers: use neither (both are too slow). Use `py-spy` (sampling via OS signals, no Python-level hooks) or `sys.monitoring` (Python 3.12+ specialized opcodes with much lower overhead).
-
-### Q4: How does `breakpoint()` work and how do you override it?
-
-**Model answer:**  
-`breakpoint()` (Python 3.7+) calls `sys.breakpointhook()`. By default, this is `pdb.set_trace()`. It's overridable:
-
-```python
-import sys
-
-def my_debugger(*args, **kwargs):
-    """Custom breakpoint hook."""
-    import ipdb  # IPython debugger
-    ipdb.set_trace()
-
-sys.breakpointhook = my_debugger
-
-# Or via environment variable (affects all Python processes):
-# PYTHONBREAKPOINT=ipdb.set_trace
-
-# Disable breakpoints entirely:
-# PYTHONBREAKPOINT=0
-```
-
-This allows teams to configure their preferred debugger without changing code. CI/CD pipelines can set `PYTHONBREAKPOINT=0` to prevent any `breakpoint()` calls in production from dropping into a debugger.
-
-`pdb.set_trace()` implementation:
-1. Gets the caller's frame via `sys._getframe(1)`.
-2. Creates a `Pdb` instance.
-3. Calls `pdb.set_trace(frame)` which calls `sys.settrace(pdb.trace_dispatch)`.
-4. `pdb.trace_dispatch` intercepts `line` events and handles the debugger REPL.
-
-### Q5: What is `sys.monitoring` and how does it improve on `sys.settrace`?
-
-**Model answer:**  
-`sys.monitoring` (PEP 669, Python 3.12) replaces `sys.settrace` for tools. Key improvements:
-
-1. **Specialized bytecodes:** When monitoring is enabled for an event type, the JIT/interpreter patches bytecode with `INSTRUMENTED_*` variants (e.g., `INSTRUMENTED_LINE` instead of `RESUME`). When disabled, original bytecodes are restored. No overhead when not monitoring.
-
-2. **Per-code-object events:** Enable line monitoring only for specific files/functions, not globally.
-
-3. **Multiple tools:** Up to 6 tools can be active simultaneously (e.g., coverage + debugger + profiler), each with its own event set.
-
-4. **No call overhead for disabled events:** `sys.settrace` with `None` trace returned from `call` still pays the cost of checking the trace function. `sys.monitoring` truly eliminates overhead for disabled events via bytecode patching.
-
-```python
-import sys
-
-sys.monitoring.use_tool_id(1, "line_tracer")
-sys.monitoring.register_callback(
-    1,
-    sys.monitoring.events.LINE,
-    lambda code, lineno: print(f"Line {lineno}")
-)
-# Enable only for specific code object:
-import types
-code = my_function.__code__
-sys.monitoring.set_local_events(1, code, sys.monitoring.events.LINE)
-```
+The real `memory_profiler` reads `/proc/self/status` (Linux) or `psutil` (cross-platform) for RSS (resident set size) — the actual physical memory used, not just Python allocations.
 
 ---
 
 ## Gotcha Follow-ups
 
-**"Can `sys.settrace` trace C extension code?"**  
-Only at the call/return boundary. `sys.settrace`'s `c_call` and `c_return` events track entry/exit of C functions. But inside a C function, there are no `line` events — C code runs without Python frame overhead. `sys.setprofile` explicitly adds `c_call`/`c_return`/`c_exception` events for this reason.
+**"Does `sys.settrace` work with C extensions?"**
+`sys.settrace` only fires for Python bytecodes. Calls into C extensions trigger `c_call`/`c_return` events in `sys.setprofile`, but NOT `line` events in `sys.settrace`. This is why coverage.py cannot measure coverage inside C extensions and why profilers show C functions as single opaque entries.
 
-**"What happens if a trace function itself raises an exception?"**  
-The exception from the trace function is silently swallowed and tracing is disabled. This is intentional — a buggy tracer shouldn't crash the traced program. `sys.gettrace()` will return `None` after this happens. This makes debugger errors extremely confusing to diagnose; trace functions should catch all exceptions internally.
+**"What happens if the trace function itself raises an exception?"**
+The exception is silently ignored and the trace function is disabled (set to `None`). This is intentional — a crashing trace function shouldn't crash the program. To debug a trace function: test it separately, add `try/except` with logging inside, or run with `python -X dev` for more verbose error reporting.
 
 ---
 
 ## Under the Hood
 
-`sys.settrace` stores the trace function in `_Py_TraceFunc` and `_Py_ProfileFunc` on the thread state (`PyThreadState`). The evaluator loop checks `tstate->c_tracefunc` at each `RESUME` (or `LINE` event position). In Python 3.12+, `sys.monitoring` patches bytecode in-place (the `co_code` bytes of the code object are modified to use `INSTRUMENTED_*` variants). This patching is done per-code-object and is atomic with respect to the GIL (or uses per-object locks in free-threaded builds).
+`sys.settrace` stores the trace function in `PyThreadState->c_tracefunc` (C function pointer) and `PyThreadState->c_traceobj` (the Python callable). The eval loop (`Python/ceval.c`) checks `tstate->c_tracefunc != NULL` and calls it at designated events. In Python 3.12+, the check is via `tstate->tracing` and `tstate->monitoring_version` — a versioned system that allows multiple trace subscribers (PEP 669, `sys.monitoring`). `sys.monitoring` (Python 3.12+) is a more efficient replacement for `sys.settrace` — it allows selective registration for specific events (CALL, LINE, RETURN, EXCEPTION) on specific code objects, reducing overhead for tools that only need a subset of events. `coverage.py` migrated to `sys.monitoring` in recent versions for the performance improvement.
