@@ -52,103 +52,139 @@ If time is short, hit these in order:
 
 ---
 
-## Repository Structure
+## Complete Topic List
 
-```
-python-interview-prep/
-├── 01-language-fundamentals/
-│   ├── mutable-immutable-identity.md
-│   ├── scoping-and-closures.md
-│   ├── decorators.md
-│   ├── descriptors.md
-│   └── metaclasses.md
-│
-├── 02-memory-management-and-gc/        ← FULLY POPULATED ★★★
-│   ├── reference-counting.md
-│   ├── generational-gc.md
-│   ├── reference-cycles.md
-│   ├── weak-references.md
-│   ├── memory-profiling.md
-│   └── interning.md
-│
-├── 03-concurrency-models/              ← FULLY POPULATED ★★★
-│   ├── gil-internals.md
-│   ├── threading.md
-│   ├── multiprocessing.md
-│   ├── concurrent-futures.md
-│   ├── asyncio-internals.md
-│   ├── mixing-paradigms.md
-│   └── gil-removal-pep703.md
-│
-├── 04-data-structures-and-performance/
-│   ├── list-dict-set-internals.md
-│   ├── time-complexity.md
-│   ├── slots.md
-│   ├── choosing-data-structures.md
-│   └── hashability.md
-│
-├── 05-typing-and-static-analysis/
-│   ├── generics-typevar-protocol.md
-│   ├── variance.md
-│   ├── runtime-vs-static-checking.md
-│   ├── structural-vs-nominal.md
-│   └── typing-pitfalls.md
-│
-├── 06-error-handling-and-context-managers/
-│   ├── exception-chaining.md
-│   ├── exception-hierarchies.md
-│   ├── context-managers.md
-│   └── contextvars.md
-│
-├── 07-packaging-and-environments/
-│   ├── import-system-internals.md
-│   ├── virtual-environments.md
-│   ├── distributable-packages.md
-│   └── namespace-packages.md
-│
-├── 08-testing-and-profiling/
-│   ├── pytest-internals.md
-│   ├── profiling.md
-│   └── benchmarking.md
-│
-├── 09-c-extensions-and-interop/
-│   ├── when-to-extend.md
-│   ├── buffer-protocol.md
-│   └── gil-release.md
-│
-├── 10-architecture-and-design-patterns/
-│   ├── package-boundaries.md
-│   ├── plugin-architectures.md
-│   ├── dependency-injection.md
-│   ├── async-event-driven.md
-│   └── versioning-deprecation.md
-│
-├── 11-common-pitfalls/
-│   ├── mutable-defaults-late-binding.md
-│   ├── mutating-while-iterating.md
-│   ├── floating-point.md
-│   ├── inheritance-vs-composition.md
-│   └── accidental-on2.md
-│
-├── 12-expert-internals-and-edge-cases/  ← FULLY POPULATED ★☆☆
-│   ├── bytecode-and-dis.md
-│   ├── function-calls-internals.md
-│   ├── specializing-adaptive-interpreter.md
-│   ├── coroutine-internals.md
-│   ├── c3-linearization-mro.md
-│   ├── abstract-base-classes-protocols.md
-│   ├── sys-settrace-setprofile.md
-│   ├── custom-import-hooks.md
-│   └── structural-pattern-matching.md
-│
-└── snippets/                           ← Copy-paste ready code
-    ├── custom_descriptor.py
-    ├── thread_safe_singleton.py
-    ├── asyncio_producer_consumer.py
-    ├── custom_context_manager.py
-    ├── plugin_loader.py
-    └── c3_linearization_demo.py
-```
+### 01 — Language Fundamentals ★★★
+
+| File | Topics Covered |
+|------|---------------|
+| [mutable-immutable-identity.md](01-language-fundamentals/mutable-immutable-identity.md) | Identity vs equality, `is` vs `==`, interning, copy vs deepcopy, immutable containers with mutable contents |
+| [scoping-and-closures.md](01-language-fundamentals/scoping-and-closures.md) | LEGB rule, `global`/`nonlocal`, closure cells, late binding, `__closure__` |
+| [decorators.md](01-language-fundamentals/decorators.md) | `functools.wraps`, class decorators, decorator factories, stacking order, `__wrapped__` |
+| [descriptors.md](01-language-fundamentals/descriptors.md) | `__get__`/`__set__`/`__delete__`, data vs non-data priority, `__set_name__`, property internals, functions as descriptors |
+| [metaclasses.md](01-language-fundamentals/metaclasses.md) | `type()` as class factory, `__prepare__`/`__new__`/`__init__` sequence, `__init_subclass__`, metaclass conflicts |
+
+### 02 — Memory Management & GC ★★★
+
+| File | Topics Covered |
+|------|---------------|
+| [reference-counting.md](02-memory-management-and-gc/reference-counting.md) | `ob_refcnt`, `sys.getrefcount`, `Py_INCREF`/`Py_DECREF`, immortal objects (3.12+) |
+| [generational-gc.md](02-memory-management-and-gc/generational-gc.md) | Three generations, `gc` module, thresholds, `gc.collect()`, `gc.disable()` trade-offs |
+| [reference-cycles.md](02-memory-management-and-gc/reference-cycles.md) | How cycles form, `tp_traverse`/`tp_clear`, `objgraph` for leak detection |
+| [weak-references.md](02-memory-management-and-gc/weak-references.md) | `weakref.ref`, `WeakValueDictionary`, `WeakKeyDictionary`, finalizers |
+| [memory-profiling.md](02-memory-management-and-gc/memory-profiling.md) | `tracemalloc`, `memory_profiler`, heap snapshots, `sys.getsizeof` limitations |
+| [interning.md](02-memory-management-and-gc/interning.md) | String interning rules, `sys.intern()`, small integer cache (−5 to 256), `id()` gotchas |
+
+### 03 — Concurrency Models ★★★
+
+| File | Topics Covered |
+|------|---------------|
+| [gil-internals.md](03-concurrency-models/gil-internals.md) | `eval_breaker`, `ceval_gil.c`, switch interval, GIL release/acquire, why IO-bound threading works |
+| [threading.md](03-concurrency-models/threading.md) | `threading.Thread`, `Lock`/`RLock`/`Condition`/`Semaphore`, `ThreadPoolExecutor`, daemon threads |
+| [multiprocessing.md](03-concurrency-models/multiprocessing.md) | `Process`, `Pool`, `Queue`/`Pipe`, `Manager`, shared memory, `spawn` vs `fork` vs `forkserver` |
+| [concurrent-futures.md](03-concurrency-models/concurrent-futures.md) | `ThreadPoolExecutor`/`ProcessPoolExecutor`, `Future`, `as_completed`, `wait`, `submit` vs `map` |
+| [asyncio-internals.md](03-concurrency-models/asyncio-internals.md) | Event loop, `selector`, `Task` driving coroutines, `Future`, `TaskGroup`, cancellation semantics |
+| [mixing-paradigms.md](03-concurrency-models/mixing-paradigms.md) | `run_in_executor`, `asyncio.to_thread`, bridging sync/async, `loop.run_until_complete` |
+| [gil-removal-pep703.md](03-concurrency-models/gil-removal-pep703.md) | PEP 703 free-threaded Python 3.13+, biased refcounting, per-object locks, `Py_MOD_GIL_NOT_USED` |
+
+### 04 — Data Structures & Performance ★★☆
+
+| File | Topics Covered |
+|------|---------------|
+| [list-dict-set-internals.md](04-data-structures-and-performance/list-dict-set-internals.md) | `PyListObject` over-allocation, compact dict `dk_indices`/`dk_entries`, set hash table probing |
+| [time-complexity.md](04-data-structures-and-performance/time-complexity.md) | Full complexity tables: list, dict, set, deque, heapq, bisect; amortized analysis |
+| [slots.md](04-data-structures-and-performance/slots.md) | `__slots__` memory savings, `member_descriptor`, inheritance pitfalls, `@dataclass(slots=True)` |
+| [choosing-data-structures.md](04-data-structures-and-performance/choosing-data-structures.md) | Decision matrix for 15+ scenarios, `deque`, `heapq`, `Counter`, `defaultdict`, `bisect` |
+| [hashability.md](04-data-structures-and-performance/hashability.md) | Hash/eq contract, `__hash__=None` when `__eq__` defined, `hash(-1)==-2`, SipHash randomization |
+
+### 05 — Typing & Static Analysis ★★☆
+
+| File | Topics Covered |
+|------|---------------|
+| [generics-typevar-protocol.md](05-typing-and-static-analysis/generics-typevar-protocol.md) | `TypeVar` constrained vs bounded, `Generic[T]`, `Protocol`, `@runtime_checkable`, `@overload`, `ParamSpec`, `Self` |
+| [variance.md](05-typing-and-static-analysis/variance.md) | Covariant/contravariant/invariant, `T_co`/`T_contra`, `Callable` variance, `list` vs `Sequence` |
+| [runtime-vs-static-checking.md](05-typing-and-static-analysis/runtime-vs-static-checking.md) | mypy vs pyright, pydantic v2, beartype O(1) sampling, typeguard full-depth, `get_type_hints()` |
+| [structural-vs-nominal.md](05-typing-and-static-analysis/structural-vs-nominal.md) | Protocol vs ABC isinstance overhead, `__subclasshook__`, virtual subclasses |
+| [typing-pitfalls.md](05-typing-and-static-analysis/typing-pitfalls.md) | `TYPE_CHECKING` guard, `Optional` vs `| None`, `TypeGuard`, `cast()` misuse, `NoReturn`/`Never` |
+
+### 06 — Error Handling & Context Managers ★★★
+
+| File | Topics Covered |
+|------|---------------|
+| [exception-hierarchies.md](06-error-handling-and-context-managers/exception-hierarchies.md) | Domain vs infrastructure layers, `__init_subclass__` auto-registration, structured error attributes |
+| [exception-chaining.md](06-error-handling-and-context-managers/exception-chaining.md) | `raise X from Y`, `__cause__`/`__context__`, `ExceptionGroup` (PEP 654), `except*`, `.split()` |
+| [context-managers.md](06-error-handling-and-context-managers/context-managers.md) | `__exit__` suppression, `@contextmanager` + try/finally, `ExitStack`, `pop_all()`, async context managers |
+| [contextvars.md](06-error-handling-and-context-managers/contextvars.md) | `ContextVar` per-task vs `threading.local()` per-thread, `Token`, `copy_context()`, thread pool propagation |
+
+### 07 — Packaging & Environments ★★☆
+
+| File | Topics Covered |
+|------|---------------|
+| [virtual-environments.md](07-packaging-and-environments/virtual-environments.md) | `pyvenv.cfg`, `sys.prefix` vs `sys.base_prefix`, pip backtracking resolver, `pip-compile`, `uv` |
+| [import-system-internals.md](07-packaging-and-environments/import-system-internals.md) | 10-step import pipeline, `sys.meta_path`, `VirtualModuleFinder`, circular import resolution, `importlib.reload` |
+| [namespace-packages.md](07-packaging-and-environments/namespace-packages.md) | No `__init__.py`, `_NamespacePath`, monorepo pattern, mixing pitfall, namespace detection |
+| [distributable-packages.md](07-packaging-and-environments/distributable-packages.md) | `pyproject.toml` (PEP 517/518/621), src layout, wheel vs sdist, `entry_points`, manylinux, trusted publishing |
+
+### 08 — Testing & Profiling ★★☆
+
+| File | Topics Covered |
+|------|---------------|
+| [pytest-internals.md](08-testing-and-profiling/pytest-internals.md) | Fixture scoping, dependency graph, `parametrize` cartesian product, `indirect`, `conftest.py`, assertion rewriting AST |
+| [profiling.md](08-testing-and-profiling/profiling.md) | `cProfile` tottime vs cumtime, py-spy sampling via ptrace, pyinstrument async-aware, tracemalloc |
+| [benchmarking.md](08-testing-and-profiling/benchmarking.md) | `timeit` min() not mean(), GC disabled, warmup for SAI (3.11+), constant folding pitfall, `pytest-benchmark` |
+
+### 09 — C Extensions & Interop ★☆☆
+
+| File | Topics Covered |
+|------|---------------|
+| [when-to-extend.md](09-c-extensions-and-interop/when-to-extend.md) | Decision matrix: ctypes / cffi / Cython / pybind11 / PyO3, libffi, `annotate=True`, numpy array passing |
+| [buffer-protocol.md](09-c-extensions-and-interop/buffer-protocol.md) | `Py_buffer`, `memoryview` zero-copy slicing, `cast()`, strided buffers, `socket.sendfile()` |
+| [gil-release.md](09-c-extensions-and-interop/gil-release.md) | `Py_BEGIN/END_ALLOW_THREADS`, `CDLL` vs `PyDLL`, Cython `with nogil:` + `prange`, free-threaded 3.13 |
+
+### 10 — Architecture & Design Patterns ★★☆
+
+| File | Topics Covered |
+|------|---------------|
+| [dependency-injection.md](10-architecture-and-design-patterns/dependency-injection.md) | Constructor injection, composition root, `functools.partial` currying, lightweight DI container, async DI |
+| [plugin-architectures.md](10-architecture-and-design-patterns/plugin-architectures.md) | `entry_points` discovery, `__init_subclass__` auto-registration, lazy registry, `importlib.util`, validation |
+| [async-event-driven.md](10-architecture-and-design-patterns/async-event-driven.md) | `asyncio.Queue` pub/sub, backpressure, `asyncio.Event`/`Condition`/`Queue` trade-offs, async state machine |
+| [package-boundaries.md](10-architecture-and-design-patterns/package-boundaries.md) | Circular import causes, ADP layered architecture, `import-linter`, `graphlib.TopologicalSorter` |
+| [versioning-deprecation.md](10-architecture-and-design-patterns/versioning-deprecation.md) | `warnings.warn` + stacklevel, `DeprecationWarning` vs `FutureWarning`, `@typing.deprecated` (3.13+), semver lifecycle |
+
+### 11 — Common Pitfalls ★★★
+
+| File | Topics Covered |
+|------|---------------|
+| [accidental-on2.md](11-common-pitfalls/accidental-on2.md) | `if x in list` in loops, string `+=`, `list.insert(0)`, nested loops, spotting via cProfile |
+| [floating-point.md](11-common-pitfalls/floating-point.md) | IEEE 754, `math.isclose`, `Decimal` from string not float, `math.fsum`, banker's rounding |
+| [inheritance-vs-composition.md](11-common-pitfalls/inheritance-vs-composition.md) | Diamond problem, C3 MRO, cooperative `super()`, mixin `__init__` with `**kwargs`, composition prefer |
+| [mutable-defaults-late-binding.md](11-common-pitfalls/mutable-defaults-late-binding.md) | `def f(x=[])`, `__defaults__`, late-binding closures in loops, `i=i` fix, `functools.partial` |
+| [mutating-while-iterating.md](11-common-pitfalls/mutating-while-iterating.md) | `RuntimeError` on dict/set, silent element skipping on list, safe patterns: copy/comprehension/reverse index |
+
+### 12 — Expert Internals & Edge Cases ★☆☆
+
+| File | Topics Covered |
+|------|---------------|
+| [abstract-base-classes-protocols.md](12-expert-internals-and-edge-cases/abstract-base-classes-protocols.md) | `__subclasshook__`, virtual subclasses, `collections.abc` mixin methods, ABC vs Protocol isinstance overhead |
+| [bytecode-and-dis.md](12-expert-internals-and-edge-cases/bytecode-and-dis.md) | Code objects, `dis.get_instructions()`, peephole optimizer, constant folding, generator/coroutine opcodes |
+| [c3-linearization-mro.md](12-expert-internals-and-edge-cases/c3-linearization-mro.md) | C3 algorithm in pure Python, worked diamond example, MRO conflict diagnosis, `__mro_entries__` |
+| [coroutine-internals.md](12-expert-internals-and-edge-cases/coroutine-internals.md) | Generator protocol, `yield from`, `async/await` desugaring, awaitable protocol, `asyncio.Task` step loop |
+| [custom-import-hooks.md](12-expert-internals-and-edge-cases/custom-import-hooks.md) | `MetaPathFinder` + `Loader`, AST-rewriting loader, database-backed modules, encrypted module loading |
+| [function-calls-internals.md](12-expert-internals-and-edge-cases/function-calls-internals.md) | `PyFrameObject`, `f_locals` snapshot vs `localsplus`, call overhead, `inspect.stack()` performance |
+| [specializing-adaptive-interpreter.md](12-expert-internals-and-edge-cases/specializing-adaptive-interpreter.md) | PEP 659 inline caching, specialized opcodes, `tp_version_tag`, deoptimization, warmup for benchmarks |
+| [structural-pattern-matching.md](12-expert-internals-and-edge-cases/structural-pattern-matching.md) | Sequence/mapping/class patterns, `__match_args__`, capture vs value pattern gotcha, exhaustiveness + `Never` |
+| [sys-settrace-setprofile.md](12-expert-internals-and-edge-cases/sys-settrace-setprofile.md) | Trace function protocol, coverage.py internals, pdb breakpoints, profiler overhead, `sys.monitoring` (3.12+) |
+
+### Runnable Snippets
+
+| File | What It Demonstrates |
+|------|---------------------|
+| [snippets/custom_descriptor.py](snippets/custom_descriptor.py) | Data descriptor with `__set_name__` and validation |
+| [snippets/thread_safe_singleton.py](snippets/thread_safe_singleton.py) | Double-checked locking with `threading.Lock` |
+| [snippets/asyncio_producer_consumer.py](snippets/asyncio_producer_consumer.py) | Bounded `asyncio.Queue` with backpressure |
+| [snippets/custom_context_manager.py](snippets/custom_context_manager.py) | `@contextmanager` with cleanup and `ExitStack` |
+| [snippets/plugin_loader.py](snippets/plugin_loader.py) | `entry_points`-based plugin discovery |
+| [snippets/c3_linearization_demo.py](snippets/c3_linearization_demo.py) | C3 merge algorithm implemented in pure Python |
 
 ---
 
